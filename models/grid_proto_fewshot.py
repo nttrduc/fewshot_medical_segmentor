@@ -8,6 +8,8 @@ import torch.nn.functional as F
 
 from .alpmodule import MultiProtoAsConv
 from .backbone.torchvision_backbones import TVDeeplabRes101Encoder
+from .backbone.convnext_encoder import ConvNeXtEncoder
+from .backbone.swin_encoder import SwinEncoder
 # DEBUG
 from pdb import set_trace
 
@@ -36,18 +38,29 @@ class FewShotSeg(nn.Module):
         self.get_encoder(in_channels)
         self.get_cls()
 
+    # def get_encoder(self, in_channels):
+    #     # if self.config['which_model'] == 'deeplab_res101':
+    #     if self.config['which_model'] == 'dlfcn_res101':
+    #         use_coco_init = self.config['use_coco_init']
+    #         self.encoder = TVDeeplabRes101Encoder(use_coco_init)
+
+    #     else:
+    #         raise NotImplementedError(f'Backbone network {self.config["which_model"]} not implemented')
+
+    #     if self.pretrained_path:
+    #         self.load_state_dict(torch.load(self.pretrained_path))
+    #         print(f'###### Pre-trained model f{self.pretrained_path} has been loaded ######')
+
     def get_encoder(self, in_channels):
-        # if self.config['which_model'] == 'deeplab_res101':
-        if self.config['which_model'] == 'dlfcn_res101':
+        if self.config['which_model'] == 'swin':
+            self.encoder = SwinEncoder()
+        elif self.config['which_model'] == 'dlfcn_res101':
             use_coco_init = self.config['use_coco_init']
             self.encoder = TVDeeplabRes101Encoder(use_coco_init)
-
         else:
             raise NotImplementedError(f'Backbone network {self.config["which_model"]} not implemented')
 
-        if self.pretrained_path:
-            self.load_state_dict(torch.load(self.pretrained_path))
-            print(f'###### Pre-trained model f{self.pretrained_path} has been loaded ######')
+
 
     def get_cls(self):
         """
@@ -62,104 +75,124 @@ class FewShotSeg(nn.Module):
             raise NotImplementedError(f'Classifier {self.config["cls_name"]} not implemented')
 
     def forward(self, supp_imgs, fore_mask, back_mask, qry_imgs, isval, val_wsize, show_viz = False):
-        """
-        Args:
-            supp_imgs: support images
-                way x shot x [B x 3 x H x W], list of lists of tensors
-            fore_mask: foreground masks for support images
-                way x shot x [B x H x W], list of lists of tensors
-            back_mask: background masks for support images
-                way x shot x [B x H x W], list of lists of tensors
-            qry_imgs: query images
-                N x [B x 3 x H x W], list of tensors
-            show_viz: return the visualization dictionary
-        """
-        # ('Please go through this piece of code carefully')
-        n_ways = len(supp_imgs)
-        n_shots = len(supp_imgs[0])
-        n_queries = len(qry_imgs)
+        try:
+            n_ways = len(supp_imgs)
+            n_shots = len(supp_imgs[0])
+            n_queries = len(qry_imgs)
 
-        assert n_ways == 1, "Multi-shot has not been implemented yet" # NOTE: actual shot in support goes in batch dimension
-        assert n_queries == 1
+            assert n_ways == 1, "Multi-shot has not been implemented yet"
+            assert n_queries == 1
 
-        sup_bsize = supp_imgs[0][0].shape[0]
-        img_size = supp_imgs[0][0].shape[-2:]
-        qry_bsize = qry_imgs[0].shape[0]
+            sup_bsize = supp_imgs[0][0].shape[0]
+            img_size = supp_imgs[0][0].shape[-2:]
+            qry_bsize = qry_imgs[0].shape[0]
 
-        assert sup_bsize == qry_bsize == 1
+            assert sup_bsize == qry_bsize == 1
 
-        imgs_concat = torch.cat([torch.cat(way, dim=0) for way in supp_imgs]
-                                + [torch.cat(qry_imgs, dim=0),], dim=0)
+            # print("[DEBUG] Shapes OK - Support Batch:", sup_bsize, "| Image size:", img_size)
+# Resize all images to 224x224 before feeding into the encoder
 
-        img_fts = self.encoder(imgs_concat, low_level = False)
-        fts_size = img_fts.shape[-2:]
+            imgs_concat = torch.cat([torch.cat(way, dim=0) for way in supp_imgs]
+                                    + [torch.cat(qry_imgs, dim=0),], dim=0)
+            imgs_concat = F.interpolate(imgs_concat, size=(224, 224), mode='bilinear', align_corners=False)
+            
+            # print("[DEBUG] Concat image shape:", imgs_concat.shape)
 
-        supp_fts = img_fts[:n_ways * n_shots * sup_bsize].view(
-            n_ways, n_shots, sup_bsize, -1, *fts_size)  # Wa x Sh x B x C x H' x W'
-        qry_fts = img_fts[n_ways * n_shots * sup_bsize:].view(
-            n_queries, qry_bsize, -1, *fts_size)   # N x B x C x H' x W'
-        fore_mask = torch.stack([torch.stack(way, dim=0)
-                                 for way in fore_mask], dim=0)  # Wa x Sh x B x H' x W'
-        fore_mask = torch.autograd.Variable(fore_mask, requires_grad = True)
-        back_mask = torch.stack([torch.stack(way, dim=0)
-                                 for way in back_mask], dim=0)  # Wa x Sh x B x H' x W'
+            img_fts = self.encoder(imgs_concat, low_level = False)
+            # print("[DEBUG] Features shape:", img_fts.shape)
 
-        ###### Compute loss ######
-        align_loss = 0
-        outputs = []
-        visualizes = [] # the buffer for visualization
+            fts_size = img_fts.shape[-2:]
 
-        for epi in range(1): # batch dimension, fixed to 1
-            fg_masks = [] # keep the way part
+            supp_fts = img_fts[:n_ways * n_shots * sup_bsize].view(
+                n_ways, n_shots, sup_bsize, -1, *fts_size)
+            qry_fts = img_fts[n_ways * n_shots * sup_bsize:].view(
+                n_queries, qry_bsize, -1, *fts_size)
 
-            '''
-            for way in range(n_ways):
-                # note: index of n_ways starts from 0
-                mean_sup_ft = supp_fts[way].mean(dim = 0) # [ nb, C, H, W]. Just assume batch size is 1 as pytorch only allows this
-                mean_sup_msk = F.interpolate(fore_mask[way].mean(dim = 0).unsqueeze(1), size = mean_sup_ft.shape[-2:], mode = 'bilinear')
-                fg_masks.append( mean_sup_msk )
+            # print("[DEBUG] supp_fts:", supp_fts.shape, "| qry_fts:", qry_fts.shape)
 
-                mean_bg_msk = F.interpolate(back_mask[way].mean(dim = 0).unsqueeze(1), size = mean_sup_ft.shape[-2:], mode = 'bilinear') # [nb, C, H, W]
-            '''
-            # re-interpolate support mask to the same size as support feature
-            res_fg_msk = torch.stack([F.interpolate(fore_mask_w, size = fts_size, mode = 'bilinear') for fore_mask_w in fore_mask], dim = 0) # [nway, ns, nb, nh', nw']
-            res_bg_msk = torch.stack([F.interpolate(back_mask_w, size = fts_size, mode = 'bilinear') for back_mask_w in back_mask], dim = 0) # [nway, ns, nb, nh', nw']
+            fore_mask = torch.stack([torch.stack(way, dim=0)
+                                    for way in fore_mask], dim=0)
+            fore_mask = torch.autograd.Variable(fore_mask, requires_grad = True)
 
+            back_mask = torch.stack([torch.stack(way, dim=0)
+                                    for way in back_mask], dim=0)
+            # print("[DEBUG] fore_mask:", fore_mask.shape, "| back_mask:", back_mask.shape)
 
-            scores          = []
-            assign_maps     = []
-            bg_sim_maps     = []
-            fg_sim_maps     = []
+        except Exception as e:
+            print("[ERROR] During input prep / feature extraction:", e)
+            raise
 
-            _raw_score, _, aux_attr = self.cls_unit(qry_fts, supp_fts, res_bg_msk, mode = BG_PROT_MODE, thresh = BG_THRESH, isval = isval, val_wsize = val_wsize, vis_sim = show_viz  )
+        try:
+            align_loss = 0
+            outputs = []
+            visualizes = []
 
-            scores.append(_raw_score)
-            assign_maps.append(aux_attr['proto_assign'])
-            if show_viz:
-                bg_sim_maps.append(aux_attr['raw_local_sims'])
+            for epi in range(1):  # fixed to 1
+                res_fg_msk = torch.stack(
+                    [F.interpolate(fore_mask_w, size=fts_size, mode='bilinear') for fore_mask_w in fore_mask], dim=0)
+                res_bg_msk = torch.stack(
+                    [F.interpolate(back_mask_w, size=fts_size, mode='bilinear') for back_mask_w in back_mask], dim=0)
 
-            for way, _msk in enumerate(res_fg_msk):
-                _raw_score, _, aux_attr = self.cls_unit(qry_fts, supp_fts, _msk.unsqueeze(0), mode = FG_PROT_MODE if F.avg_pool2d(_msk, 4).max() >= FG_THRESH and FG_PROT_MODE != 'mask' else 'mask', thresh = FG_THRESH, isval = isval, val_wsize = val_wsize, vis_sim = show_viz  )
+                # print("[DEBUG] Resized mask shape FG:", res_fg_msk.shape, "| BG:", res_bg_msk.shape)
+
+                scores = []
+                assign_maps = []
+                bg_sim_maps = []
+                fg_sim_maps = []
+
+                _raw_score, _, aux_attr = self.cls_unit(qry_fts, supp_fts, res_bg_msk,
+                                                        mode=BG_PROT_MODE, thresh=BG_THRESH,
+                                                        isval=isval, val_wsize=val_wsize, vis_sim=show_viz)
+
+                # print("[DEBUG] Background raw_score:", _raw_score.shape)
 
                 scores.append(_raw_score)
+                assign_maps.append(aux_attr['proto_assign'])
                 if show_viz:
-                    fg_sim_maps.append(aux_attr['raw_local_sims'])
+                    bg_sim_maps.append(aux_attr['raw_local_sims'])
 
-            pred = torch.cat(scores, dim=1)  # N x (1 + Wa) x H' x W'
-            outputs.append(F.interpolate(pred, size=img_size, mode='bilinear'))
+                for way, _msk in enumerate(res_fg_msk):
+                    try:
+                        mode = FG_PROT_MODE if F.avg_pool2d(_msk, 4).max() >= FG_THRESH and FG_PROT_MODE != 'mask' else 'mask'
+                        _raw_score, _, aux_attr = self.cls_unit(
+                            qry_fts, supp_fts, _msk.unsqueeze(0), mode=mode,
+                            thresh=FG_THRESH, isval=isval, val_wsize=val_wsize, vis_sim=show_viz)
 
-            ###### Prototype alignment loss ######
-            if self.config['align'] and self.training:
-                align_loss_epi = self.alignLoss(qry_fts[:, epi], pred, supp_fts[:, :, epi],
-                                                fore_mask[:, :, epi], back_mask[:, :, epi])
-                align_loss += align_loss_epi
-        output = torch.stack(outputs, dim=1)  # N x B x (1 + Wa) x H x W
-        output = output.view(-1, *output.shape[2:])
-        assign_maps = torch.stack(assign_maps, dim = 1)
-        bg_sim_maps    = torch.stack(bg_sim_maps, dim = 1) if show_viz else None
-        fg_sim_maps    = torch.stack(fg_sim_maps, dim = 1) if show_viz else None
+                        scores.append(_raw_score)
+                        if show_viz:
+                            fg_sim_maps.append(aux_attr['raw_local_sims'])
+                    except Exception as e:
+                        print(f"[ERROR] Foreground cls_unit failed at way {way}:", e)
+                        raise
 
-        return output, align_loss / sup_bsize, [bg_sim_maps, fg_sim_maps], assign_maps
+                pred = torch.cat(scores, dim=1)
+                outputs.append(F.interpolate(pred, size=img_size, mode='bilinear'))
+                # print("[DEBUG] Output prediction shape:", pred.shape)
+
+                if self.config['align'] and self.training:
+                    try:
+                        align_loss_epi = self.alignLoss(qry_fts[:, epi], pred, supp_fts[:, :, epi],
+                                                        fore_mask[:, :, epi], back_mask[:, :, epi])
+                        align_loss += align_loss_epi
+                        # print("[DEBUG] Align loss added:", align_loss_epi.item())
+                    except Exception as e:
+                        # print("[ERROR] During align loss calculation:", e)
+                        raise
+
+            output = torch.stack(outputs, dim=1)
+            output = output.view(-1, *output.shape[2:])
+            assign_maps = torch.stack(assign_maps, dim=1)
+            bg_sim_maps = torch.stack(bg_sim_maps, dim=1) if show_viz else None
+            fg_sim_maps = torch.stack(fg_sim_maps, dim=1) if show_viz else None
+
+            # print("[DEBUG] Final output shape:", output.shape)
+
+            return output, align_loss / sup_bsize, [bg_sim_maps, fg_sim_maps], assign_maps
+
+        except Exception as e:
+            print("[ERROR] During forward pass:", e)
+            raise
+
 
 
     # Batch was at the outer loop

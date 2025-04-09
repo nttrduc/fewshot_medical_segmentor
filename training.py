@@ -10,7 +10,7 @@ import torch.optim
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import MultiStepLR
 import torch.backends.cudnn as cudnn
-import numpy as np
+# import numpy as np
 
 from models.grid_proto_fewshot import FewShotSeg
 from dataloaders.dev_customized_med import med_fewshot
@@ -19,10 +19,10 @@ from dataloaders.dataset_utils import DATASET_INFO
 import dataloaders.augutils as myaug
 
 from util.utils import set_seed, t2n, to01, compose_wt_simple
-from util.metric import Metric
+# from util.metric import Metric
 
 from config_ssl_upload import ex
-import tqdm
+# import tqdm
 
 # config pre-trained model caching path
 os.environ['TORCH_HOME'] = "./pretrained_model"
@@ -116,18 +116,11 @@ def main(_run, _config, _log):
         for _, sample_batched in enumerate(trainloader):
             # Prepare input
             i_iter += 1
-            # add writers
-            support_images = [[shot.cuda() for shot in way]
-                              for way in sample_batched['support_images']]
-            support_fg_mask = [[shot[f'fg_mask'].float().cuda() for shot in way]
-                               for way in sample_batched['support_mask']]
-            support_bg_mask = [[shot[f'bg_mask'].float().cuda() for shot in way]
-                               for way in sample_batched['support_mask']]
-
-            query_images = [query_image.cuda()
-                            for query_image in sample_batched['query_images']]
-            query_labels = torch.cat(
-                [query_label.long().cuda() for query_label in sample_batched['query_labels']], dim=0)
+            support_images = [[shot.cuda() for shot in way] for way in sample_batched['support_images']]
+            support_fg_mask = [[shot[f'fg_mask'].float().cuda() for shot in way] for way in sample_batched['support_mask']]
+            support_bg_mask = [[shot[f'bg_mask'].float().cuda() for shot in way] for way in sample_batched['support_mask']]
+            query_images = [query_image.cuda() for query_image in sample_batched['query_images']]
+            query_labels = torch.cat([query_label.long().cuda() for query_label in sample_batched['query_labels']], dim=0)
 
             optimizer.zero_grad()
             # FIXME: in the model definition, filter out the failure case where pseudolabel falls outside of image or too small to calculate a prototype

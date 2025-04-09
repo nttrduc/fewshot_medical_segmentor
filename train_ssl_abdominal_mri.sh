@@ -25,7 +25,7 @@ NSTEP=100100
 DECAY=0.95
 
 MAX_ITER=1000 # defines the size of an epoch
-SNAPSHOT_INTERVAL=25000 # interval for saving snapshot
+SNAPSHOT_INTERVAL=5000 # interval for saving snapshot
 SEED='1234'
 
 ###### Validation configs ######
@@ -47,7 +47,7 @@ do
     fi
 
     python3 training.py with \
-    'modelname=dlfcn_res101' \
+    'modelname=swin' \
     'usealign=True' \
     'optim_type=sgd' \
     num_workers=$NWORKER \

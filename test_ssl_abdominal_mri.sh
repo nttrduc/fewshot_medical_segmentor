@@ -46,10 +46,10 @@ do
         mkdir $LOGDIR
     fi
 
-    RELOAD_PATH='please feed the path to the trained weights here' # path to the reloaded model
+    RELOAD_PATH='/root/ducnt/fewshot_medical_segmentor/exps/myexperiments_MIDDLE_0/mySSL_train_CHAOST2_Superpix_lbgroup0_scale_MIDDLE_vfold0_CHAOST2_Superpix_sets_0_1shot/29/snapshots/15000.pth' # path to the reloaded model
 
     python3 validation.py with \
-    'modelname=dlfcn_res101' \
+    'modelname=swin' \
     'usealign=True' \
     'optim_type=sgd' \
     reload_model_path=$RELOAD_PATH \
