@@ -12,13 +12,13 @@ class SwinEncoder(nn.Module):
         self.high_level_channels = self.backbone.feature_info[-3]['num_chs']   # lấy từ feats[-2]
 
         self.low_level_proj = nn.Sequential(
-            nn.Conv2d(self.low_level_channels, aux_dim_keep, kernel_size=1)
+            nn.Conv2d(self.low_level_channels, aux_dim_keep, kernel_size=1),
             # nn.ReLU(inplace=True)
             # nn.Tanh()
         )
 
         self.high_level_proj = nn.Sequential(
-            nn.Conv2d(self.high_level_channels, 256, kernel_size=1)
+            nn.Conv2d(self.high_level_channels, 256, kernel_size=1),
             # nn.ReLU(inplace=True)
             # nn.softmax(dim=1)
             # nn.Tanh()

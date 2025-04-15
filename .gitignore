@@ -2,10 +2,14 @@
 __pycache__/
 *.py[cod]
 *$py.class
-
+models/backbone/Swin-Unet
+sam2
+chaos_MR_T2_normalized/
+models/backbone/swin_unet
+models/backbone/SAM2_UNet
 # C extensions
 *.so
-
+*.pth
 # Distribution / packaging
 .Python
 build/

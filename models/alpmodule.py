@@ -142,4 +142,3 @@ class MultiProtoAsConv(nn.Module):
 
         else:
             raise NotImplementedError
-

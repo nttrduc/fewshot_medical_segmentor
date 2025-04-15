@@ -155,11 +155,11 @@ def main(_run, _config, _log):
                 log_loss['align_loss'] = 0
 
                 print(f'step {i_iter+1}: loss: {loss}, align_loss: {align_loss},')
-
-            if (i_iter + 1) % _config['save_snapshot_every'] == 0:
+            
+            if (i_iter + 1) % 3000 == 0:
                 _log.info('###### Taking snapshot ######')
                 torch.save(model.state_dict(),
-                           os.path.join(f'{_run.observers[0].dir}/snapshots', f'{i_iter + 1}.pth'))
+                           os.path.join(f'{_run.observers[0].dir}/snapshots', f'slic_{i_iter + 1}.pth'))
 
             if data_name == 'C0_Superpix' or data_name == 'CHAOST2_Superpix':
                 if (i_iter + 1) % _config['max_iters_per_load'] == 0:

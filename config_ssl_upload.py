@@ -45,7 +45,7 @@ def cfg():
     lr_step_gamma = 0.95
     ignore_label = 255
     print_interval = 100
-    save_snapshot_every = 5000
+    save_snapshot_every = 1000
     max_iters_per_load = 1000 # epoch size, interval for reloading the dataset
     scan_per_load = -1 # numbers of 3d scans per load for saving memory. If -1, load the entire dataset to the memory
     which_aug = 'sabs_aug' # standard data augmentation with intensity and geometric transforms
@@ -69,7 +69,7 @@ def cfg():
     reload_model_path = None # path for reloading a trained model (overrides ms-coco initialization)
     proto_grid_size = 8 # L_H, L_W = (32, 32) / 8 = (4, 4)  in training
     feature_hw = [32, 32] # feature map size, should couple this with backbone in future
-
+#     feature_hw = 256
     # SSL
     superpix_scale = 'MIDDLE' #MIDDLE/ LARGE
 
