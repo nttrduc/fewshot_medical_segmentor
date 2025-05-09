@@ -1,6 +1,7 @@
 """
 Validation script
 """
+import csv
 import os
 import shutil
 import torch
@@ -44,194 +45,255 @@ def main(_run, _config, _log):
     cudnn.benchmark = True
     torch.cuda.set_device(device=_config['gpu_id'])
     torch.set_num_threads(1)
+    
+    snapshots_dir = "/root/ducnt/fewshot_medical_segmentor/exps/myexperiments_MIDDLE_0/mySSL_train_CHAOST2_Superpix_lbgroup0_scale_MIDDLE_vfold0_CHAOST2_Superpix_sets_0_1shot/73/snapshots"
 
-    _log.info(f'###### Reload model {_config["reload_model_path"]} ######')
-    model = FewShotSeg(pretrained_path = _config['reload_model_path'], cfg=_config['model'])
-    model = model.cuda()
-    model.eval()
+# List tất cả các file .pth trong thư mục snapshots
+    weight_files = [f for f in os.listdir(snapshots_dir) if f.endswith('.pth')]
+    # print(weight_files)
+    for weight_file in weight_files:
+        # _log.info(f'###### Reload model {weight_file} ######')
+        # model = FewShotSeg(pretrained_path = os.path.join(snapshots_dir, weight_file), cfg=_config['model'], backbone='vgg16')
+        # model = model.cuda()
+        # model.eval()
+        parts = weight_file.split('_')              # tách theo dấu gạch dưới
 
-    _log.info('###### Load data ######')
-    ### Training set
-    data_name = _config['dataset']
-    if data_name == 'SABS_Superpix':
-        baseset_name = 'SABS'
-        max_label = 13
-    elif data_name == 'C0_Superpix':
-        raise NotImplementedError
-        baseset_name = 'C0'
-        max_label = 3
-    elif data_name == 'CHAOST2_Superpix':
-        baseset_name = 'CHAOST2'
-        max_label = 4
-    else:
-        raise ValueError(f'Dataset: {data_name} not found')
+        # backbone sẽ nằm ở vị trí thứ 1 sau 'epoch5000'
+        backbone = parts[1]
+        if backbone.startswith("mobile") or backbone.startswith("mit"):
+            backbone = backbone +"_" + parts[2]
+        print("Backbone starting: ", backbone)
+        # if backbone not in  [ "vgg16","vgg19","densenet121", "densenet161", "xception"]:
 
-    test_labels = DATASET_INFO[baseset_name]['LABEL_GROUP']['pa_all'] - DATASET_INFO[baseset_name]['LABEL_GROUP'][_config["label_sets"]]
+        pretrained_path = os.path.join(snapshots_dir, weight_file)
+        _log.info(f'###### Reload model {_config["reload_model_path"]} ######')
+        model = FewShotSeg(pretrained_path = pretrained_path, cfg=_config['model'], backbone=backbone)
+        model = model.cuda()
+        model.eval()
+        total_params = model.encoder.total_params
+        _log.info('###### Load data ######')
+        ### Training set
+        data_name = _config['dataset']
+        if data_name == 'SABS_Superpix':
+            baseset_name = 'SABS'
+            max_label = 13
+        elif data_name == 'C0_Superpix':
+            raise NotImplementedError
+            baseset_name = 'C0'
+            max_label = 3
+        elif data_name == 'CHAOST2_Superpix':
+            baseset_name = 'CHAOST2'
+            max_label = 4
+        else:
+            raise ValueError(f'Dataset: {data_name} not found')
 
-    ### Transforms for data augmentation
-    te_transforms = None
+        # test_labels = DATASET_INFO[baseset_name]['LABEL_GROUP']['pa_all'] - DATASET_INFO[baseset_name]['LABEL_GROUP'][_config["label_sets"]]
+        test_labels = DATASET_INFO[baseset_name]['LABEL_GROUP']['pa_all'] 
 
-    assert _config['scan_per_load'] < 0 # by default we load the entire dataset directly
+        ### Transforms for data augmentation
+        te_transforms = None
 
-    _log.info(f'###### Labels excluded in training : {[lb for lb in _config["exclude_cls_list"]]} ######')
-    _log.info(f'###### Unseen labels evaluated in testing: {[lb for lb in test_labels]} ######')
+        assert _config['scan_per_load'] < 0 # by default we load the entire dataset directly
 
-    if baseset_name == 'SABS': # for CT we need to know statistics of 
-        tr_parent = SuperpixelDataset( # base dataset
-            which_dataset = baseset_name,
-            base_dir=_config['path'][data_name]['data_dir'],
+        _log.info(f'###### Labels excluded in training : {[lb for lb in _config["exclude_cls_list"]]} ######')
+        _log.info(f'###### Unseen labels evaluated in testing: {[lb for lb in test_labels]} ######')
+
+        if baseset_name == 'SABS': # for CT we need to know statistics of 
+            tr_parent = SuperpixelDataset( # base dataset
+                which_dataset = baseset_name,
+                base_dir=_config['path'][data_name]['data_dir'],
+                idx_split = _config['eval_fold'],
+                mode='train',
+                min_fg=str(_config["min_fg_data"]), # dummy entry for superpixel dataset
+                transforms=None,
+                nsup = _config['task']['n_shots'],
+                scan_per_load = _config['scan_per_load'],
+                exclude_list = _config["exclude_cls_list"],
+                superpix_scale = _config["superpix_scale"],
+                fix_length = _config["max_iters_per_load"] if (data_name == 'C0_Superpix') or (data_name == 'CHAOST2_Superpix') else None
+            )
+            norm_func = tr_parent.norm_func
+        else:
+            norm_func = get_normalize_op(modality = 'MR', fids = None)
+
+
+        te_dataset, te_parent = med_fewshot_val(
+            dataset_name = baseset_name,
+            base_dir=_config['path'][baseset_name]['data_dir'],
             idx_split = _config['eval_fold'],
-            mode='train',
-            min_fg=str(_config["min_fg_data"]), # dummy entry for superpixel dataset
-            transforms=None,
-            nsup = _config['task']['n_shots'],
             scan_per_load = _config['scan_per_load'],
-            exclude_list = _config["exclude_cls_list"],
-            superpix_scale = _config["superpix_scale"],
-            fix_length = _config["max_iters_per_load"] if (data_name == 'C0_Superpix') or (data_name == 'CHAOST2_Superpix') else None
+            act_labels=test_labels,
+            npart = _config['task']['npart'],
+            nsup = _config['task']['n_shots'],
+            extern_normalize_func = norm_func
         )
-        norm_func = tr_parent.norm_func
-    else:
-        norm_func = get_normalize_op(modality = 'MR', fids = None)
 
+        ### dataloaders
+        testloader = DataLoader(
+            te_dataset,
+            batch_size = 1,
+            shuffle=False,
+            num_workers=1,
+            pin_memory=False,
+            drop_last=False
+        )
 
-    te_dataset, te_parent = med_fewshot_val(
-        dataset_name = baseset_name,
-        base_dir=_config['path'][baseset_name]['data_dir'],
-        idx_split = _config['eval_fold'],
-        scan_per_load = _config['scan_per_load'],
-        act_labels=test_labels,
-        npart = _config['task']['npart'],
-        nsup = _config['task']['n_shots'],
-        extern_normalize_func = norm_func
-    )
+        _log.info('###### Set validation nodes ######')
+        mar_val_metric_node = Metric(max_label=max_label, n_scans= len(te_dataset.dataset.pid_curr_load) - _config['task']['n_shots'])
 
-    ### dataloaders
-    testloader = DataLoader(
-        te_dataset,
-        batch_size = 1,
-        shuffle=False,
-        num_workers=1,
-        pin_memory=False,
-        drop_last=False
-    )
+        _log.info('###### Starting validation ######')
+        model.eval()
+        mar_val_metric_node.reset()
 
-    _log.info('###### Set validation nodes ######')
-    mar_val_metric_node = Metric(max_label=max_label, n_scans= len(te_dataset.dataset.pid_curr_load) - _config['task']['n_shots'])
+        with torch.no_grad():
+            save_pred_buffer = {} # indexed by class
 
-    _log.info('###### Starting validation ######')
-    model.eval()
-    mar_val_metric_node.reset()
+            for curr_lb in test_labels:
+                te_dataset.set_curr_cls(curr_lb)
+                support_batched = te_parent.get_support(curr_class = curr_lb, class_idx = [curr_lb], scan_idx = _config["support_idx"], npart=_config['task']['npart'])
 
-    with torch.no_grad():
-        save_pred_buffer = {} # indexed by class
+                # way(1 for now) x part x shot x 3 x H x W] #
+                support_images = [[shot.cuda() for shot in way]
+                                    for way in support_batched['support_images']] # way x part x [shot x C x H x W]
+                suffix = 'mask'
+                support_fg_mask = [[shot[f'fg_{suffix}'].float().cuda() for shot in way]
+                                    for way in support_batched['support_mask']]
+                support_bg_mask = [[shot[f'bg_{suffix}'].float().cuda() for shot in way]
+                                    for way in support_batched['support_mask']]
 
-        for curr_lb in test_labels:
-            te_dataset.set_curr_cls(curr_lb)
-            support_batched = te_parent.get_support(curr_class = curr_lb, class_idx = [curr_lb], scan_idx = _config["support_idx"], npart=_config['task']['npart'])
+                curr_scan_count = -1 # counting for current scan
+                _lb_buffer = {} # indexed by scan
 
-            # way(1 for now) x part x shot x 3 x H x W] #
-            support_images = [[shot.cuda() for shot in way]
-                                for way in support_batched['support_images']] # way x part x [shot x C x H x W]
-            suffix = 'mask'
-            support_fg_mask = [[shot[f'fg_{suffix}'].float().cuda() for shot in way]
-                                for way in support_batched['support_mask']]
-            support_bg_mask = [[shot[f'bg_{suffix}'].float().cuda() for shot in way]
-                                for way in support_batched['support_mask']]
+                last_qpart = 0 # used as indicator for adding result to buffer
 
-            curr_scan_count = -1 # counting for current scan
-            _lb_buffer = {} # indexed by scan
+                for sample_batched in testloader:
 
-            last_qpart = 0 # used as indicator for adding result to buffer
+                    _scan_id = sample_batched["scan_id"][0] # we assume batch size for query is 1
+                    if _scan_id in te_parent.potential_support_sid: # skip the support scan, don't include that to query
+                        continue
+                    if sample_batched["is_start"]:
+                        ii = 0
+                        curr_scan_count += 1
+                        _scan_id = sample_batched["scan_id"][0]
+                        outsize = te_dataset.dataset.info_by_scan[_scan_id]["array_size"]
+                        outsize = (256, 256, outsize[0]) # original image read by itk: Z, H, W, in prediction we use H, W, Z
+                        _pred = np.zeros( outsize )
+                        _pred.fill(np.nan)
 
-            for sample_batched in testloader:
+                    q_part = sample_batched["part_assign"] # the chunck of query, for assignment with support
+                    query_images = [sample_batched['image'].cuda()]
+                    query_labels = torch.cat([ sample_batched['label'].cuda()], dim=0)
 
-                _scan_id = sample_batched["scan_id"][0] # we assume batch size for query is 1
-                if _scan_id in te_parent.potential_support_sid: # skip the support scan, don't include that to query
-                    continue
-                if sample_batched["is_start"]:
-                    ii = 0
-                    curr_scan_count += 1
-                    _scan_id = sample_batched["scan_id"][0]
-                    outsize = te_dataset.dataset.info_by_scan[_scan_id]["array_size"]
-                    outsize = (256, 256, outsize[0]) # original image read by itk: Z, H, W, in prediction we use H, W, Z
-                    _pred = np.zeros( outsize )
-                    _pred.fill(np.nan)
+                    # [way, [part, [shot x C x H x W]]] ->
+                    sup_img_part = [[shot_tensor.unsqueeze(0) for shot_tensor in support_images[0][q_part]]]   # way(1) x shot x [B(1) x C x H x W]
+                    sup_fgm_part = [[shot_tensor.unsqueeze(0) for shot_tensor in support_fg_mask[0][q_part]]]
+                    sup_bgm_part = [[shot_tensor.unsqueeze(0) for shot_tensor in support_bg_mask[0][q_part]]]
 
-                q_part = sample_batched["part_assign"] # the chunck of query, for assignment with support
-                query_images = [sample_batched['image'].cuda()]
-                query_labels = torch.cat([ sample_batched['label'].cuda()], dim=0)
+                    query_pred, _, _, _ = model( sup_img_part , sup_fgm_part, sup_bgm_part, query_images, isval = True, val_wsize = _config["val_wsize"] )
 
-                # [way, [part, [shot x C x H x W]]] ->
-                sup_img_part = [[shot_tensor.unsqueeze(0) for shot_tensor in support_images[0][q_part]]]   # way(1) x shot x [B(1) x C x H x W]
-                sup_fgm_part = [[shot_tensor.unsqueeze(0) for shot_tensor in support_fg_mask[0][q_part]]]
-                sup_bgm_part = [[shot_tensor.unsqueeze(0) for shot_tensor in support_bg_mask[0][q_part]]]
+                    query_pred = np.array(query_pred.argmax(dim=1)[0].cpu())
+                    _pred[..., ii] = query_pred.copy()
 
-                query_pred, _, _, assign_mats = model( sup_img_part , sup_fgm_part, sup_bgm_part, query_images, isval = True, val_wsize = _config["val_wsize"] )
-
-                query_pred = np.array(query_pred.argmax(dim=1)[0].cpu())
-                _pred[..., ii] = query_pred.copy()
-
-                if (sample_batched["z_id"] - sample_batched["z_max"] <= _config['z_margin']) and (sample_batched["z_id"] - sample_batched["z_min"] >= -1 * _config['z_margin']):
-                    mar_val_metric_node.record(query_pred, np.array(query_labels[0].cpu()), labels=[curr_lb], n_scan=curr_scan_count) 
-                else:
-                    pass
-
-                ii += 1
-                # now check data format
-                if sample_batched["is_end"]:
-                    if _config['dataset'] != 'C0':
-                        _lb_buffer[_scan_id] = _pred.transpose(2,0,1) # H, W, Z -> to Z H W
+                    if (sample_batched["z_id"] - sample_batched["z_max"] <= _config['z_margin']) and (sample_batched["z_id"] - sample_batched["z_min"] >= -1 * _config['z_margin']):
+                        mar_val_metric_node.record(query_pred, np.array(query_labels[0].cpu()), labels=[curr_lb], n_scan=curr_scan_count) 
                     else:
-                        lb_buffer[_scan_id] = _pred
+                        pass
 
-            save_pred_buffer[str(curr_lb)] = _lb_buffer
+                    ii += 1
+                    # now check data format
+                    if sample_batched["is_end"]:
+                        if _config['dataset'] != 'C0':
+                            _lb_buffer[_scan_id] = _pred.transpose(2,0,1) # H, W, Z -> to Z H W
+                        else:
+                            _lb_buffer[_scan_id] = _pred
 
-        ### save results
-        for curr_lb, _preds in save_pred_buffer.items():
-            for _scan_id, _pred in _preds.items():
-                _pred *= float(curr_lb)
-                itk_pred = convert_to_sitk(_pred, te_dataset.dataset.info_by_scan[_scan_id])
-                fid = os.path.join(f'{_run.observers[0].dir}/interm_preds', f'scan_{_scan_id}_label_{curr_lb}.nii.gz')
-                sitk.WriteImage(itk_pred, fid, True)
-                _log.info(f'###### {fid} has been saved ######')
+                save_pred_buffer[str(curr_lb)] = _lb_buffer
 
-        del save_pred_buffer
+            ### save results
+            for curr_lb, _preds in save_pred_buffer.items():
+                for _scan_id, _pred in _preds.items():
+                    _pred *= float(curr_lb)
+                    itk_pred = convert_to_sitk(_pred, te_dataset.dataset.info_by_scan[_scan_id])
+                    fid = os.path.join(f'{_run.observers[0].dir}/interm_preds', f'scan_{_scan_id}_label_{curr_lb}.nii.gz')
+                    sitk.WriteImage(itk_pred, fid, True)
+                    # _log.info(f'###### {fid} has been saved ######')
 
-    del sample_batched, support_images, support_bg_mask, query_images, query_labels, query_pred
+            del save_pred_buffer
 
-    # compute dice scores by scan
-    m_classDice,_, m_meanDice,_, m_rawDice = mar_val_metric_node.get_mDice(labels=sorted(test_labels), n_scan=None, give_raw = True)
+        del sample_batched, support_images, support_bg_mask, query_images, query_labels, query_pred
 
-    m_classPrec,_, m_meanPrec,_,  m_classRec,_, m_meanRec,_, m_rawPrec, m_rawRec = mar_val_metric_node.get_mPrecRecall(labels=sorted(test_labels), n_scan=None, give_raw = True)
+        # compute dice scores by scan
+        m_classDice,_, m_meanDice,_, m_rawDice = mar_val_metric_node.get_mDice(labels=sorted(test_labels), n_scan=None, give_raw = True)
 
-    mar_val_metric_node.reset() # reset this calculation node
+        m_classPrec,_, m_meanPrec,_,  m_classRec,_, m_meanRec,_, m_rawPrec, m_rawRec = mar_val_metric_node.get_mPrecRecall(labels=sorted(test_labels), n_scan=None, give_raw = True)
 
-    # write validation result to log file
-    _run.log_scalar('mar_val_batches_classDice', m_classDice.tolist())
-    _run.log_scalar('mar_val_batches_meanDice', m_meanDice.tolist())
-    _run.log_scalar('mar_val_batches_rawDice', m_rawDice.tolist())
+        mar_val_metric_node.reset() # reset this calculation node
 
-    _run.log_scalar('mar_val_batches_classPrec', m_classPrec.tolist())
-    _run.log_scalar('mar_val_batches_meanPrec', m_meanPrec.tolist())
-    _run.log_scalar('mar_val_batches_rawPrec', m_rawPrec.tolist())
+        # write validation result to log file
+        _run.log_scalar('mar_val_batches_classDice', m_classDice.tolist())
+        _run.log_scalar('mar_val_batches_meanDice', m_meanDice.tolist())
+        _run.log_scalar('mar_val_batches_rawDice', m_rawDice.tolist())
 
-    _run.log_scalar('mar_val_batches_classRec', m_classRec.tolist())
-    _run.log_scalar('mar_val_al_batches_meanRec', m_meanRec.tolist())
-    _run.log_scalar('mar_val_al_batches_rawRec', m_rawRec.tolist())
+        _run.log_scalar('mar_val_batches_classPrec', m_classPrec.tolist())
+        _run.log_scalar('mar_val_batches_meanPrec', m_meanPrec.tolist())
+        _run.log_scalar('mar_val_batches_rawPrec', m_rawPrec.tolist())
 
-    _log.info(f'mar_val batches classDice: {m_classDice}')
-    _log.info(f'mar_val batches meanDice: {m_meanDice}')
+        _run.log_scalar('mar_val_batches_classRec', m_classRec.tolist())
+        _run.log_scalar('mar_val_al_batches_meanRec', m_meanRec.tolist())
+        _run.log_scalar('mar_val_al_batches_rawRec', m_rawRec.tolist())
 
-    _log.info(f'mar_val batches classPrec: {m_classPrec}')
-    _log.info(f'mar_val batches meanPrec: {m_meanPrec}')
+        _log.info(f'mar_val batches classDice: {m_classDice}')
+        _log.info(f'mar_val batches meanDice: {m_meanDice}')
 
-    _log.info(f'mar_val batches classRec: {m_classRec}')
-    _log.info(f'mar_val batches meanRec: {m_meanRec}')
+        _log.info(f'mar_val batches classPrec: {m_classPrec}')
+        _log.info(f'mar_val batches meanPrec: {m_meanPrec}')
 
-    print("============ ============")
+        _log.info(f'mar_val batches classRec: {m_classRec}')
+        _log.info(f'mar_val batches meanRec: {m_meanRec}')
 
-    _log.info(f'End of validation')
+        print("============ ============")
+
+        _log.info(f'End of validation')
+        
+        
+        # Lấy tên file CSV
+        csv_path = 'backbone_validation_report.csv'
+
+        # Nếu file chưa tồn tại thì ghi header
+        write_header = not os.path.exists(csv_path)
+
+        # Dòng dữ liệu mới
+        row = ["mobilenet_v2_slic_sam2_V2"]  # Tên backbone kèm epoch, ví dụ: epoch5000_backbone_densenet121.pth
+
+        # Thêm Dice 4 cơ quan + mean
+        row += [round(x.item(), 4) for x in m_classDice] + [round(m_meanDice.item(), 4)]
+
+        # Thêm Precision 4 cơ quan + mean
+        row += [round(x.item(), 4) for x in m_classPrec] + [round(m_meanPrec.item(), 4)]
+
+        # Thêm Recall 4 cơ quan + mean
+        row += [round(x.item(), 4) for x in m_classRec] + [round(m_meanRec.item(), 4)]
+
+        row += [total_params]
+        # Ghi vào file CSV
+        with open(csv_path, mode='a', newline='') as f:
+            writer = csv.writer(f)
+            if write_header:
+                header = (
+                    ['Backbone'] +
+                    [f'Dice_organ{i+1}' for i in range(len(m_classDice))] + ['Dice_Mean'] +
+                    [f'Prec_organ{i+1}' for i in range(len(m_classPrec))] + ['Prec_Mean'] +
+                    [f'Rec_organ{i+1}' for i in range(len(m_classRec))] + ['Rec_Mean'] +
+                    [
+                    'total_params'
+                        
+                    ]
+                )
+                writer.writerow(header)
+            writer.writerow(row)
+
+        
     return 1
 
 
+    

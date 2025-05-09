@@ -13,6 +13,8 @@ models/backbone/SAM2_UNet
 # Distribution / packaging
 .Python
 build/
+data/
+data_sam2/
 chaos_MR_T2_normalized/
 develop-eggs/
 dist/

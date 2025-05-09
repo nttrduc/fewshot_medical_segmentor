@@ -66,7 +66,6 @@ class MultiProtoAsConv(nn.Module):
 
         # no need to merge with gridconv+
         elif mode == 'gridconv': # using local prototypes only
-
             input_size = qry.shape
             nch = input_size[1]
 
@@ -98,7 +97,6 @@ class MultiProtoAsConv(nn.Module):
 
 
         elif mode == 'gridconv+': # local and global prototypes
-
             input_size = qry.shape
             nch = input_size[1]
             nb_q = input_size[0]

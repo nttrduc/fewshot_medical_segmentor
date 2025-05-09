@@ -18,18 +18,17 @@ RELOAD_PATH="/root/ducnt/fewshot_medical_segmentor/exps/myexperiments_MIDDLE_0/m
 ### Use L/R kidney as testing classes
 LABEL_SETS=0 
 EXCLU='[2,3]' # setting 2: excluding kidneies in training set to test generalization capability even though they are unlabeled. Use [] for setting 1 by Roy et al.
-
-### Use Liver and spleen as testing classes
+## Use Liver and spleen as testing classes
 # LABEL_SETS=1 
 # EXCLU='[1,4]' 
 
 ###### Training configs ######
 NSTEP=100100
-DECAY=0.95
+DECAY=0.95 # learning rate decay
 
-MAX_ITER=1000 # defines the size of an epoch
+MAX_ITER=1400 # defines the size of an epoch
 SNAPSHOT_INTERVAL=5000 # interval for saving snapshot
-SEED='1234'
+SEED='1'
 
 ###### Validation configs ######
 SUPP_ID='[4]' #  # using the additionally loaded scan as support

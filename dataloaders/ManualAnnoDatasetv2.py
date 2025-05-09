@@ -84,6 +84,7 @@ class ManualAnnoDataset(BaseDataset):
         else:
             raise Exception
         self.actual_dataset = self.read_dataset()
+        print("length of the dataset: ", len(self.actual_dataset))
         self.size = len(self.actual_dataset)
         self.overall_slice_by_cls = self.read_classfiles()
         self.update_subclass_lookup()
@@ -211,7 +212,6 @@ class ManualAnnoDataset(BaseDataset):
         with open(   os.path.join(self.base_dir, 'classmap_1.json') , 'r' ) as fopen:
             self.tp1_cls_map =  json.load( fopen)
             fopen.close()
-
         return cls_map
 
     def __getitem__(self, index):

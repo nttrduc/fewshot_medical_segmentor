@@ -75,8 +75,10 @@ class SuperpixelDataset(BaseDataset):
         if self.is_train:
             if scan_per_load > 0: # if the dataset is too large, only reload a subset in each sub-epoch
                 self.pid_curr_load = np.random.choice( self.scan_ids, replace = False, size = self.scan_per_load)
+                print("Randomly selected scans for training: ", self.pid_curr_load)
             else: # load the entire set without a buffer
                 self.pid_curr_load = self.scan_ids
+                print("Fixed scans for training: ", self.pid_curr_load)
         elif mode == 'val':
             self.pid_curr_load = self.scan_ids
         else:
@@ -86,6 +88,8 @@ class SuperpixelDataset(BaseDataset):
         self.overall_slice_by_cls = self.read_classfiles()
 
         print("###### Initial scans loaded: ######")
+        self.pid_curr_load = [x for x in self.pid_curr_load if not x.startswith('4')]
+        
         print(self.pid_curr_load)
 
     def get_scanids(self, mode, idx_split):
@@ -158,15 +162,18 @@ class SuperpixelDataset(BaseDataset):
             self.scan_z_idx[scan_id] = [-1 for _ in range(img.shape[-1])]
 
             lb = read_nii_bysitk(itm["lbs_fid"])
-            lb = lb.transpose(1,2,0)
+            lb = np.transpose(lb, (1, 2, 0))
             lb = np.int32(lb)
 
             img = img[:256, :256, :]
             lb = lb[:256, :256, :]
 
             # format of slices: [axial_H x axial_W x Z]
-
-            assert img.shape[-1] == lb.shape[-1]
+            print(f'###### Dataset: {scan_id} has {img.shape} slices ######')
+            print(f'###### Dataset: {scan_id} has {lb.shape} slices ######')
+        
+            if img.shape[-1] != lb.shape[-1]:
+                continue
             base_idx = img.shape[-1] // 2 # index of the middle slice
 
             # re-organize 3D images into 2D slices and record essential information for each slice
@@ -244,13 +251,17 @@ class SuperpixelDataset(BaseDataset):
         index = index % len(self.actual_dataset)
         curr_dict = self.actual_dataset[index]
         sup_max_cls = curr_dict['sup_max_cls']
-        if sup_max_cls < 1:
+        if sup_max_cls <= 1:
+            # vì randint(1, 1) vẫn lỗi
+            # new_index = torch.randint(0, len(self.actual_dataset), (1,)).item()
             return self.__getitem__(index + 1)
 
         image_t = curr_dict["img"]
         label_raw = curr_dict["lb"]
 
         for _ex_cls in self.exclude_lbs:
+            # print("real_label_name:", self.real_label_name)
+            # print("_ex_cls:", _ex_cls)
             if curr_dict["z_id"] in self.tp1_cls_map[self.real_label_name[_ex_cls]][curr_dict["scan_id"]]: # if using setting 1, this slice need to be excluded since it contains label which is supposed to be unseen
                 return self.__getitem__(torch.randint(low = 0, high = self.__len__() - 1, size = (1,)))
 
@@ -326,6 +337,7 @@ class SuperpixelDataset(BaseDataset):
         copy-paste from basic naive dataset configuration
         """
         if self.fix_length != None:
+            # print(f'###### Dataset: Length of actual {len(self.actual_dataset)} ######')
             assert self.fix_length >= len(self.actual_dataset)
             return self.fix_length
         else:

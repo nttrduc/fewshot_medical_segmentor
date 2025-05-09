@@ -1,26 +1,18 @@
 """
-ALPNet
+ALPNet with SSFP Integration
 """
 from collections import OrderedDict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .alpmodule import MultiProtoAsConv
-from .cross_prototype import CrossAttentionProtoMatching
-from .backbone.torchvision_backbones import TVDeeplabRes101Encoder
-from .backbone.convnext_encoder import ConvNeXtEncoder
-from .backbone.swin_encoder import SwinEncoder
-from .backbone.SAM2_UNet.sam_model import SAM2UNetEncoderWrapper  # Import SAM2UNetEncoderWrapper
+from .alpmodule import MultiProtoAsConv # Giữ nguyên module này
+from .backbone.torchvision_backbones import BackboneEncode
 # DEBUG
+from pdb import set_trace
 
-from models.backbone.swin_unet.networks.vision_transformer import SwinUnet
-from models.backbone.swin_unet.config import get_config
-# import torch
-# from pdb import set_trace
-
-# import pickle
-# import torchvision
+import pickle
+import torchvision
 
 # options for type of prototypes
 FG_PROT_MODE = 'gridconv+' # using both local and global prototype
@@ -29,49 +21,49 @@ BG_PROT_MODE = 'gridconv'  # using local prototype only. Also 'mask' refers to u
 # thresholds for deciding class of prototypes
 FG_THRESH = 0.95
 BG_THRESH = 0.95
+
+# Biến DEBUG_SHAPES toàn cục (bạn nên quản lý qua config)
+DEBUG_SHAPES = False # Đặt thành True để bật debug
+
 class FewShotSeg(nn.Module):
-    def __init__(self, in_channels=3, pretrained_path=None, cfg=None, eval_pyramid=False):
+    """
+    ALPNet
+    Args:
+        in_channels:        Number of input channels
+        cfg:                Model configurations
+    """
+    def __init__(self, in_channels=3, pretrained_path=None, cfg=None, backbone=None):
         super(FewShotSeg, self).__init__()
         self.pretrained_path = pretrained_path
+        self.backbone = backbone
         self.config = cfg or {'align': False}
+
+        global DEBUG_SHAPES
+        DEBUG_SHAPES = self.config.get('debug_shapes', False)
+        if DEBUG_SHAPES: print(f"[DEBUG] FewShotSeg __init__: DEBUG_SHAPES set to {DEBUG_SHAPES}")
+
+        # SSFP specific configs
+        self.use_ssfp = self.config.get('use_ssfp', False)
+        self.ssfp_confidence_thresh = self.config.get('ssfp_confidence_thresh', 0.7)
+        self.ssfp_alpha_P_star = self.config.get('ssfp_alpha_P_star', 0.5) # alpha1 cho Ps_sp
+
+        if DEBUG_SHAPES and self.use_ssfp:
+            print(f"[DEBUG] SSFP Enabled: use_ssfp={self.use_ssfp}, "
+                  f"ssfp_confidence_thresh={self.ssfp_confidence_thresh}, "
+                  f"ssfp_alpha_P_star={self.ssfp_alpha_P_star}")
+
         self.get_encoder(in_channels)
         self.get_cls()
-#         self.fg_thresh_param = nn.Parameter(torch.tensor(0.95).logit())  # sigmoid(0.5) = 0.5
-#         self.bg_thresh_param = nn.Parameter(torch.tensor(0.95).logit())  # tùy chọn
-
 
     def get_encoder(self, in_channels):
-        if self.config['which_model'] == 'swin':
-            self.encoder = SwinEncoder()
-        elif self.config['which_model'] == 'dlfcn_res101':
-            use_coco_init = self.config['use_coco_init']
-            self.encoder = TVDeeplabRes101Encoder(use_coco_init)
-        elif self.config['which_model'] == 'convnext':
-            self.encoder = ConvNeXtEncoder()
-        elif self.config['which_model'] == 'sam2unet':
-            self.encoder = SAM2UNetEncoderWrapper("/root/ducnt/fewshot_medical_segmentor/Pretrained checkpoints/SAM2UNet-Polyp.pth", 256)
-        elif self.config['which_model'] == 'swin_unet':
-            config = get_config()
-            self.encoder = SwinUnet(config=config)
+        if self.config['which_model'] == 'dlfcn_res101':
+            self.encoder = BackboneEncode(backbone=self.backbone)
+            if DEBUG_SHAPES: print(f"[DEBUG] Encoder: BackboneEncode initialized.")
         else:
             raise NotImplementedError(f'Backbone network {self.config["which_model"]} not implemented')
 
         if self.pretrained_path:
-            
-            # self.load_state_dict(torch.load(self.pretrained_path))
-            
-            
-            # Bước 2: Load state_dict chứa key mới (ví dụ từ model đã có pyramid_fusion)
-            loaded_state = torch.load(self.pretrained_path)
-
-            # Bước 3: Lấy state_dict của model cũ để biết các key được phép
-            model_state = self.state_dict()
-
-            # Bước 4: Lọc bỏ các key không khớp với model cũ
-            filtered_state = {k: v for k, v in loaded_state.items() if k in model_state}
-
-            # Bước 5: Load state_dict đã lọc vào model cũ
-            self.load_state_dict(filtered_state, strict=False)
+            self.load_state_dict(torch.load(self.pretrained_path), strict=False)
             print(f'###### Pre-trained model f{self.pretrained_path} has been loaded ######')
 
     def get_cls(self):
@@ -79,215 +71,437 @@ class FewShotSeg(nn.Module):
         feature_hw = self.config["feature_hw"]
         assert self.config['cls_name'] == 'grid_proto'
         if self.config['cls_name'] == 'grid_proto':
-            self.cls_unit = MultiProtoAsConv(proto_grid=[proto_hw, proto_hw], feature_hw=feature_hw)
+            self.cls_unit = MultiProtoAsConv(proto_grid = [proto_hw, proto_hw], feature_hw =  self.config["feature_hw"])
+            if DEBUG_SHAPES: print(f"[DEBUG] Classifier: MultiProtoAsConv initialized with proto_grid={proto_hw}, feature_hw={feature_hw}.")
         else:
             raise NotImplementedError(f'Classifier {self.config["cls_name"]} not implemented')
 
-    def forward(self, supp_imgs, fore_mask, back_mask, qry_imgs, isval, val_wsize, show_viz=False):
+    def _generate_map_prototype(self, features, mask):
+        """
+        Generates a prototype using Masked Average Pooling (MAP).
+        Args:
+            features: Tensor of shape [B, C, H, W] or [C, H, W]
+            mask: Tensor of shape [B, 1, H, W] or [1, H, W] or [B, H, W] or [H,W]
+        Returns:
+            prototype: Tensor of shape [B, C] or [C]
+        """
+        if features.ndim == 3: # C, H, W -> 1, C, H, W
+            features = features.unsqueeze(0)
+        if mask.ndim == 2: # H, W -> 1, 1, H, W
+            mask = mask.unsqueeze(0).unsqueeze(0)
+        elif mask.ndim == 3: # B, H, W -> B, 1, H, W
+             mask = mask.unsqueeze(1)
+        
+        # Đảm bảo mask và features có cùng số batch
+        if features.shape[0] != mask.shape[0] and features.shape[0] == 1:
+            features = features.expand(mask.shape[0], -1, -1, -1)
+        if features.shape[0] != mask.shape[0] and mask.shape[0] == 1:
+            mask = mask.expand(features.shape[0], -1, -1, -1)
+            
+        # Masked Average Pooling
+        # print(f"Debug _generate_map_prototype: features.shape {features.shape}, mask.shape {mask.shape}")
+        prototype = torch.sum(features * mask, dim=(-1, -2)) / (mask.sum(dim=(-1, -2)) + 1e-5) # B x C
+        return prototype.squeeze(0) if prototype.shape[0] == 1 else prototype
 
+
+    def _safe_norm_prototype(self, proto, eps=1e-4):
+        """ Normalizes a prototype vector or a batch of prototype vectors. """
+        if proto is None or proto.numel() == 0:
+            return proto
+        norm = torch.norm(proto, p=2, dim=-1, keepdim=True)
+        norm = torch.max(norm, torch.ones_like(norm) * eps)
+        return proto / norm
+
+    def forward(self, supp_imgs, fore_mask, back_mask, qry_imgs, isval, val_wsize, show_viz = False):
+        if DEBUG_SHAPES: print("\n--- Entering FewShotSeg.forward (with SSFP logic) ---")
         n_ways = len(supp_imgs)
         n_shots = len(supp_imgs[0])
         n_queries = len(qry_imgs)
+        if DEBUG_SHAPES: print(f"[DEBUG] n_ways: {n_ways}, n_shots: {n_shots}, n_queries: {n_queries}")
 
-        assert n_ways == 1, "Multi-shot has not been implemented yet" 
+        assert n_ways == 1, "1-way setting"
         assert n_queries == 1
 
         sup_bsize = supp_imgs[0][0].shape[0]
         img_size = supp_imgs[0][0].shape[-2:]
         qry_bsize = qry_imgs[0].shape[0]
+        if DEBUG_SHAPES:
+            print(f"[DEBUG] supp_imgs[0][0].shape: {supp_imgs[0][0].shape}") # [1,3,256,256]
+            print(f"[DEBUG] qry_imgs[0].shape: {qry_imgs[0].shape}") # [1,3,256,256]
 
-        assert sup_bsize == qry_bsize == 1
+        assert sup_bsize == qry_bsize == 1 # Code này chỉ xử lý B=1 cho support và query trong 1 episode
 
-        imgs_concat = torch.cat([torch.cat(way, dim=0) for way in supp_imgs] + [torch.cat(qry_imgs, dim=0)], dim=0)
-        img_fts = self.encoder(imgs_concat, low_level=False)
+        imgs_concat = torch.cat([torch.cat(way, dim=0) for way in supp_imgs]
+                                + [torch.cat(qry_imgs, dim=0),], dim=0)
+        if DEBUG_SHAPES: print(f"[DEBUG] imgs_concat.shape: {imgs_concat.shape}") # [2,3,256,256]
+
+        img_fts = self.encoder(imgs_concat, low_level = False)
         fts_size = img_fts.shape[-2:]
+        if DEBUG_SHAPES: print(f"[DEBUG] img_fts.shape: {img_fts.shape}, fts_size: {fts_size}") # [2,C_feat,16,16]
 
+        # supp_fts: [Way, Shot, Batch_sup, C_feat, H_feat, W_feat]
         supp_fts = img_fts[:n_ways * n_shots * sup_bsize].view(
             n_ways, n_shots, sup_bsize, -1, *fts_size)
-        qry_fts = img_fts[n_ways * n_shots * sup_bsize:].view(
+        # qry_fts: [N_queries, Batch_qry, C_feat, H_feat, W_feat]
+        qry_fts_orig = img_fts[n_ways * n_shots * sup_bsize:].view(
             n_queries, qry_bsize, -1, *fts_size)
-        fore_mask = torch.stack([torch.stack(way, dim=0) for way in fore_mask], dim=0)
-        back_mask = torch.stack([torch.stack(way, dim=0) for way in back_mask], dim=0)
+        if DEBUG_SHAPES:
+            print(f"[DEBUG] supp_fts.shape: {supp_fts.shape}") # [1,1,1,C_feat,16,16]
+            print(f"[DEBUG] qry_fts_orig.shape: {qry_fts_orig.shape}") # [1,1,C_feat,16,16]
+
+        # Masks (original size)
+        fore_mask_orig = torch.stack([torch.stack(way, dim=0) for way in fore_mask], dim=0)
+        back_mask_orig = torch.stack([torch.stack(way, dim=0) for way in back_mask], dim=0)
+        if DEBUG_SHAPES:
+            print(f"[DEBUG] fore_mask_orig.shape: {fore_mask_orig.shape}") # [1,1,1,256,256]
+
+        # Interpolated masks for cls_unit
+        res_fg_msk = torch.stack([F.interpolate(fore_mask_w, size=fts_size, mode='bilinear') for fore_mask_w in fore_mask_orig], dim=0)
+        res_bg_msk = torch.stack([F.interpolate(back_mask_w, size=fts_size, mode='bilinear') for back_mask_w in back_mask_orig], dim=0)
+        if DEBUG_SHAPES:
+            print(f"[DEBUG] res_fg_msk.shape: {res_fg_msk.shape}") # [1,1,1,16,16]
 
         align_loss = 0
         outputs = []
-        visualizes = []
-
-        for epi in range(1):
-            fg_masks = []
-            res_fg_msk = torch.stack([F.interpolate(fore_mask_w, size=fts_size, mode='bilinear') for fore_mask_w in fore_mask], dim=0)
-            res_bg_msk = torch.stack([F.interpolate(back_mask_w, size=fts_size, mode='bilinear') for back_mask_w in back_mask], dim=0)
-
-            scores = []
-            assign_maps = []
-            bg_sim_maps = []
-            fg_sim_maps = []
-
-            _raw_score, _, aux_attr = self.cls_unit(qry_fts, supp_fts, res_bg_msk, mode=BG_PROT_MODE, thresh=BG_THRESH, isval=isval, val_wsize=val_wsize, vis_sim=show_viz, )
-            scores.append(_raw_score)
-            assign_maps.append(aux_attr['proto_assign'])
-            if show_viz:
-                bg_sim_maps.append(aux_attr['raw_local_sims'])
-
-            for way, _msk in enumerate(res_fg_msk):
-                _raw_score, _, aux_attr = self.cls_unit(qry_fts, supp_fts, _msk.unsqueeze(0), mode=FG_PROT_MODE if F.avg_pool2d(_msk, 4).max() >= FG_THRESH and FG_PROT_MODE != 'mask' else 'mask', thresh=FG_THRESH, isval=isval, val_wsize=val_wsize, vis_sim=show_viz)
-                scores.append(_raw_score)
-                if show_viz:
-                    fg_sim_maps.append(aux_attr['raw_local_sims'])
-
-            pred = torch.cat(scores, dim=1)
-            outputs.append(F.interpolate(pred, size=img_size, mode='bilinear'))
-
-            # Dynamic Prototype Refinement - Call this function to update the prototypes
-            self.dynamic_prototype_refinement(supp_fts, res_fg_msk, res_bg_msk, pred)
-
-            # Feature Regularization - Add feature regularization loss to the total loss
-            feature_reg_loss = self.feature_regularization(qry_fts, supp_fts)
-            align_loss += feature_reg_loss
-
-            if self.config['align'] and self.training:
-                align_loss_epi = self.alignLoss(qry_fts[:, epi], pred, supp_fts[:, :, epi], fore_mask[:, :, epi], back_mask[:, :, epi])
-                align_loss += align_loss_epi
-
-        output = torch.stack(outputs, dim=1)
-        output = output.view(-1, *output.shape[2:])
-        assign_maps = torch.stack(assign_maps, dim=1)
-        bg_sim_maps = torch.stack(bg_sim_maps, dim=1) if show_viz else None
-        fg_sim_maps = torch.stack(fg_sim_maps, dim=1) if show_viz else None
-
-        return output, align_loss / sup_bsize, [bg_sim_maps, fg_sim_maps], assign_maps
+        assign_maps_list = [] # Sửa tên để tránh nhầm lẫn
+        bg_sim_maps_list = []
+        fg_sim_maps_list = []
 
 
-    def dynamic_prototype_refinement(self, supp_fts, res_fg_msk, res_bg_msk, qry_pred=None):
-        """
-        Momentum + Uncertainty-aware prototype refinement.
-        """
-        with torch.no_grad():
-            new_fg_prototypes = self.calculate_prototypes(supp_fts, res_fg_msk)
-            new_bg_prototypes = self.calculate_prototypes(supp_fts, res_bg_msk)
-
-            # Optional: Use uncertainty (entropy) of query predictions to weigh the update
-            if qry_pred is not None:
-                uncertainty = self.calculate_uncertainty(qry_pred)  # [1, 1, H, W]
-                weight = 1.0 - uncertainty  # Higher certainty => stronger update
-            else:
-                weight = 1.0  # Default full update
-
-            momentum = 0.9  # Momentum hyperparameter
-
-            # Update foreground prototypes with momentum and uncertainty weighting
-            if not hasattr(self, 'fg_prototypes'):
-                self.fg_prototypes = new_fg_prototypes
-            else:
-                self.fg_prototypes = [
-                    momentum * old + (1 - momentum) * weight * new
-                    for old, new in zip(self.fg_prototypes, new_fg_prototypes)
-                ]
-
-            if not hasattr(self, 'bg_prototypes'):
-                self.bg_prototypes = new_bg_prototypes
-            else:
-                self.bg_prototypes = [
-                    momentum * old + (1 - momentum) * weight * new
-                    for old, new in zip(self.bg_prototypes, new_bg_prototypes)
-                ]
-
-    def calculate_uncertainty(self, pred):
-        """
-        Calculate uncertainty map from query prediction using entropy.
-        Input: pred - logits [1, C, H, W]
-        Output: uncertainty map [1, 1, H, W]
-        """
-        prob = F.softmax(pred, dim=1)  # [1, C, H, W]
-        entropy = -torch.sum(prob * torch.log(prob + 1e-8), dim=1, keepdim=True)  # [1, 1, H, W]
-        normalized_entropy = entropy / torch.log(torch.tensor(prob.shape[1], dtype=torch.float32))  # Normalize to [0,1]
-        return normalized_entropy
-
-    def calculate_prototypes(self, supp_fts, masks):
-        """
-        Calculate masked average features as prototypes.
-        Input shape: supp_fts [n_ways, n_shots, 1, C, H, W], masks [n_ways, n_shots, 1, H, W]
-        Output: list of prototype tensors per class
-        """
-        n_ways, n_shots, _, C, H, W = supp_fts.shape
-        supp_fts = supp_fts.view(n_ways * n_shots, C, H, W)
-        masks = masks.view(n_ways * n_shots, 1, H, W)
-
-        masked_fts = supp_fts * masks  # Element-wise masking
-        sum_fts = masked_fts.sum(dim=(2, 3))  # [N, C]
-        sum_mask = masks.sum(dim=(2, 3)) + 1e-5  # [N, 1]
-        proto = sum_fts / sum_mask  # [N, C]
-        proto = proto.view(n_ways, n_shots, C).mean(dim=1)  # [n_ways, C]
-
-        return [p for p in proto]  # list of [C] per class
-
-
-
-    def calculate_prototypes(self, supp_fts, masks):
-        """
-        Calculate new prototypes based on support features and their respective masks.
-        """
-        # Example: Compute average feature for each prototype based on mask
-        prototypes = []
-        for mask in masks:
-            prototype = torch.mean(supp_fts * mask.unsqueeze(1), dim=0)
-            prototypes.append(prototype)
-        return prototypes
-
-    def update_prototypes(self, fg_prototypes, bg_prototypes):
-        """
-        Update the stored prototypes based on new calculated prototypes.
-        """
-        self.fg_prototypes = fg_prototypes
-        self.bg_prototypes = bg_prototypes
-
-    def feature_regularization(self, qry_fts, supp_fts):
-        """
-        Calculate feature regularization loss to minimize the difference between query and support features.
-        """
-        # Assuming L2 regularization here
+        # Vì batch size (sup_bsize, qry_bsize) trong một episode là 1, vòng lặp epi này chỉ chạy 1 lần.
+        # Nếu bạn muốn xử lý batch size > 1 cho các episodes, cần điều chỉnh logic này.
+        # Hiện tại, qry_fts_orig có shape [N_queries, B_qry, C, Hf, Wf]
+        # Ta sẽ lấy slice theo N_queries và B_qry (đều là 1 ở đây)
+        current_qry_fts = qry_fts_orig[0] # Shape [B_qry, C, Hf, Wf], B_qry=1 -> [1, C, Hf, Wf]
         
-        if qry_fts.dim() == 6:
-            qry_fts = qry_fts.squeeze(0)  # Bỏ chiều đầu
-        if supp_fts.dim() == 6:
-            supp_fts = supp_fts.squeeze(0)
-        loss = F.mse_loss(qry_fts, supp_fts)
-#         loss = F.mse_loss(qry_fts, supp_fts)
-        return loss
+        # ---- Initial Prediction using Support Prototypes ----
+        initial_scores_list = []
+
+        if DEBUG_SHAPES: print(f"[DEBUG] Initial Pred: Calling cls_unit for BACKGROUND...")
+        # cls_unit mong đợi qry: [B_eff_q, C, Hf, Wf], sup_x: [Way_eff, Shot_eff, B_eff_s, C, Hf, Wf], sup_y: [Way_eff, Shot_eff, B_eff_s, Hf, Wf]
+        # Truyền qry_fts_orig trực tiếp (N_queries, B_qry, C, Hf, Wf)
+        # supp_fts (Way, Shot, B_sup, C, Hf, Wf)
+        # res_bg_msk (Way, Shot, B_sup, Hf, Wf)
+        bg_score, _, bg_aux_attr = self.cls_unit(qry_fts_orig, supp_fts, res_bg_msk, mode=BG_PROT_MODE, thresh=BG_THRESH, isval=isval, val_wsize=val_wsize, vis_sim=show_viz)
+        initial_scores_list.append(bg_score)
+        if DEBUG_SHAPES: print(f"[DEBUG] Initial Pred: BG _raw_score.shape: {bg_score.shape if bg_score is not None else 'None'}") # [1,1,16,16] (B_qry, 1_score, Hf, Wf)
+        
+        assign_maps_list.append(bg_aux_attr['proto_assign'])
+        if show_viz and bg_aux_attr.get('raw_local_sims') is not None:
+            bg_sim_maps_list.append(bg_aux_attr['raw_local_sims'])
+
+        # Foreground scores (1 way)
+        # res_fg_msk có shape [Way, Shot, B_sup, Hf, Wf]. Ta chỉ có 1 way.
+        current_res_fg_msk_for_way0 = res_fg_msk[0] # Shape [Shot, B_sup, Hf, Wf]
+        if DEBUG_SHAPES: print(f"[DEBUG] Initial Pred: Calling cls_unit for FOREGROUND way 0...")
+        # _msk.unsqueeze(0) trong code gốc là để tạo chiều Way cho cls_unit.
+        # res_fg_msk đã có chiều Way rồi.
+        fg_score, _, fg_aux_attr = self.cls_unit(qry_fts_orig, supp_fts, res_fg_msk,
+                                                 mode=FG_PROT_MODE if F.avg_pool2d(current_res_fg_msk_for_way0, 4).max() >= FG_THRESH and FG_PROT_MODE != 'mask' else 'mask',
+                                                 thresh=FG_THRESH, isval=isval, val_wsize=val_wsize, vis_sim=show_viz)
+        initial_scores_list.append(fg_score)
+        if DEBUG_SHAPES: print(f"[DEBUG] Initial Pred: FG way 0 _raw_score.shape: {fg_score.shape if fg_score is not None else 'None'}") # [1,1,16,16]
+        if show_viz and fg_aux_attr.get('raw_local_sims') is not None:
+            fg_sim_maps_list.append(fg_aux_attr['raw_local_sims'])
+
+        initial_pred = torch.cat(initial_scores_list, dim=1) # [B_qry, Num_classes, Hf, Wf]
+        if DEBUG_SHAPES: print(f"[DEBUG] initial_pred.shape (concatenated scores): {initial_pred.shape}") # [1,2,16,16]
+
+        final_pred_for_loss = initial_pred # Mặc định
+
+        # ---- QESP Logic (Query-Enriched Support Feature Map) ----
+        if self.config.get('use_qesp', True):
+            if DEBUG_SHAPES: print(f"[DEBUG] --- Applying QESP (Feature Map Update) ---")
+            # initial_pred shape: [B_qry, Num_classes (BG+FG), Hf, Wf] -> [1, 2, 16, 16]
+            # current_qry_fts shape: [B_qry, C, Hf, Wf] -> [1, C_feat, 16, 16]
+
+            # 1. Gán nhãn Pixel trên Query và tạo Global Prototypes từ Query
+            query_pixel_labels = initial_pred.argmax(dim=1) # [B_qry, Hf, Wf] -> [1, 16, 16]
+            query_fg_pixel_mask = (query_pixel_labels == 1).float().unsqueeze(1) # [B_qry, 1, Hf, Wf]
+            query_bg_pixel_mask = (query_pixel_labels == 0).float().unsqueeze(1) # [B_qry, 1, Hf, Wf]
+
+            Pq_fg_global_norm = None
+            if query_fg_pixel_mask.sum() > 0:
+                pq_fg_temp = self._generate_map_prototype(current_qry_fts, query_fg_pixel_mask) # [B_qry, C] or [C]
+                Pq_fg_global_norm = self._safe_norm_prototype(pq_fg_temp)
+                if DEBUG_SHAPES: print(f"[DEBUG] QESP: Pq_fg_global_norm.shape: {Pq_fg_global_norm.shape if Pq_fg_global_norm is not None else 'None'}")
+            
+            Pq_bg_global_norm = None
+            if query_bg_pixel_mask.sum() > 0:
+                pq_bg_temp = self._generate_map_prototype(current_qry_fts, query_bg_pixel_mask) # [B_qry, C] or [C]
+                Pq_bg_global_norm = self._safe_norm_prototype(pq_bg_temp)
+                if DEBUG_SHAPES: print(f"[DEBUG] QESP: Pq_bg_global_norm.shape: {Pq_bg_global_norm.shape if Pq_bg_global_norm is not None else 'None'}")
+
+            # 2. Chuẩn bị Support Feature Map và Masks Gốc
+            #    supp_fts: [Way, Shot, B_sup, C, Hf, Wf] -> [1,1,1,C,16,16]
+            #    res_fg_msk / res_bg_msk: [Way, Shot, B_sup, Hf, Wf] -> [1,1,1,16,16]
+            #    Ta sẽ làm việc với slice [0,0,0] vì Way, Shot, B_sup đều là 1
+            
+            supp_fts_slice = supp_fts[0, 0, 0].clone() # [C, Hf, Wf] -> [C,16,16]
+            res_fg_msk_slice = res_fg_msk[0, 0, 0]     # [Hf, Wf] -> [16,16] (không có channel)
+            res_bg_msk_slice = res_bg_msk[0, 0, 0]     # [Hf, Wf] -> [16,16]
+
+            if DEBUG_SHAPES:
+                print(f"[DEBUG] QESP: supp_fts_slice.shape: {supp_fts_slice.shape}")
+                print(f"[DEBUG] QESP: res_fg_msk_slice.shape: {res_fg_msk_slice.shape}")
+
+            # 3. Cập nhật các Feature Vector trong `supp_fts_slice`
+            alpha = self.config.get('qesp_alpha_update', 0.5)
+            updated_supp_fts_slice = supp_fts_slice.clone() # Tạo bản sao để cập nhật
+
+            # Cập nhật các vùng FG của support feature map
+            if Pq_fg_global_norm is not None:
+                # Pq_fg_global_norm có thể là [C] hoặc [B_qry, C]. Ta dùng [C] (vì B_qry=1)
+                pq_fg_to_use = Pq_fg_global_norm[0] if Pq_fg_global_norm.ndim == 2 else Pq_fg_global_norm # Shape [C]
+                
+                # Lặp qua từng pixel/vector của supp_fts_slice
+                # res_fg_msk_slice là [Hf, Wf]. Ta cần nó ở dạng [1, Hf, Wf] để nhân với [C, Hf, Wf]
+                fg_mask_for_update = res_fg_msk_slice.unsqueeze(0) # [1, Hf, Wf]
+                
+                # Lấy các feature vector thuộc FG trên support
+                original_fg_features_support = supp_fts_slice * fg_mask_for_update # [C, Hf, Wf], các vùng BG thành 0
+                
+                # Cập nhật: original_feature * alpha + query_global_proto * (1-alpha)
+                # pq_fg_to_use.unsqueeze(-1).unsqueeze(-1) -> [C, 1, 1] để broadcast với [C, Hf, Wf]
+                updated_fg_part = alpha * original_fg_features_support + \
+                                  (1.0 - alpha) * pq_fg_to_use.unsqueeze(-1).unsqueeze(-1)
+                
+                # Chỉ cập nhật những vị trí thuộc FG
+                updated_supp_fts_slice = torch.where(fg_mask_for_update.bool(), updated_fg_part, updated_supp_fts_slice)
+                if DEBUG_SHAPES: print(f"[DEBUG] QESP: FG features in support map updated.")
+
+            # Cập nhật các vùng BG của support feature map
+            if Pq_bg_global_norm is not None:
+                pq_bg_to_use = Pq_bg_global_norm[0] if Pq_bg_global_norm.ndim == 2 else Pq_bg_global_norm # Shape [C]
+                bg_mask_for_update = res_bg_msk_slice.unsqueeze(0) # [1, Hf, Wf]
+                original_bg_features_support = supp_fts_slice * bg_mask_for_update
+                updated_bg_part = alpha * original_bg_features_support + \
+                                  (1.0 - alpha) * pq_bg_to_use.unsqueeze(-1).unsqueeze(-1)
+                updated_supp_fts_slice = torch.where(bg_mask_for_update.bool(), updated_bg_part, updated_supp_fts_slice)
+                if DEBUG_SHAPES: print(f"[DEBUG] QESP: BG features in support map updated.")
+
+            # Tạo supp_fts_new và các mask gốc (res_fg_msk, res_bg_msk không đổi vì hình dạng support không đổi)
+            # updated_supp_fts_slice là [C, Hf, Wf]
+            # Cần đưa về shape [Way, Shot, B_sup, C, Hf, Wf] cho cls_unit
+            supp_fts_new = updated_supp_fts_slice.unsqueeze(0).unsqueeze(0).unsqueeze(0)
+            if DEBUG_SHAPES: print(f"[DEBUG] QESP: supp_fts_new.shape: {supp_fts_new.shape}")
+
+            # 4. Tính Score Lần Hai với `supp_fts_new`
+            #    res_fg_msk và res_bg_msk gốc vẫn được sử dụng để xác định vùng nào của supp_fts_new
+            #    sẽ được dùng để tạo prototype cho FG và BG khi cls_unit được gọi.
+            final_scores_list_qesp = []
+
+            if DEBUG_SHAPES: print(f"[DEBUG] QESP: Recalculating scores with updated support features...")
+            # Gọi cls_unit với supp_fts_new
+            bg_score_qesp, _, _ = self.cls_unit(qry_fts_orig, supp_fts_new, res_bg_msk, 
+                                              mode=BG_PROT_MODE, thresh=BG_THRESH, 
+                                              isval=isval, val_wsize=val_wsize, vis_sim=False) # Không cần vis_sim lần 2
+            final_scores_list_qesp.append(bg_score_qesp)
+            if DEBUG_SHAPES: print(f"[DEBUG] QESP: New BG score shape: {bg_score_qesp.shape if bg_score_qesp is not None else 'None'}")
+
+            # current_res_fg_msk_for_way0 vẫn là res_fg_msk[0] như ban đầu
+            fg_score_qesp, _, _ = self.cls_unit(qry_fts_orig, supp_fts_new, res_fg_msk,
+                                              mode=FG_PROT_MODE if F.avg_pool2d(current_res_fg_msk_for_way0, 4).max() >= FG_THRESH and FG_PROT_MODE != 'mask' else 'mask',
+                                              thresh=FG_THRESH, isval=isval, val_wsize=val_wsize, vis_sim=False)
+            final_scores_list_qesp.append(fg_score_qesp)
+            if DEBUG_SHAPES: print(f"[DEBUG] QESP: New FG score shape: {fg_score_qesp.shape if fg_score_qesp is not None else 'None'}")
+            
+            final_pred_for_loss = torch.cat(final_scores_list_qesp, dim=1) # [B_qry, 2, Hf, Wf]
+            if DEBUG_SHAPES: print(f"[DEBUG] QESP: final_pred_for_loss.shape (after QESP feature map update): {final_pred_for_loss.shape}")
+        
+        else: # Nếu không dùng QESP (hoặc SSFP cũ), thì giữ nguyên initial_pred
+            final_pred_for_loss = initial_pred
+        
+        # Các bước còn lại của forward (interpolate, alignment loss, etc.) giữ nguyên
+        # ...
 
 
+        outputs.append(F.interpolate(final_pred_for_loss, size=img_size, mode='bilinear'))
+        if DEBUG_SHAPES: print(f"[DEBUG] outputs[-1].shape (interpolated final pred): {outputs[-1].shape}")
 
-    def alignLoss(self, qry_fts, pred, supp_fts, fore_mask, back_mask):
-        n_ways, n_shots = len(fore_mask), len(fore_mask[0])
+        # ---- Alignment Loss ----
+        if self.config['align'] and self.training:
+            if DEBUG_SHAPES: print(f"[DEBUG] --- Calculating align_loss_epi ---")
+            # Sử dụng final_pred_for_loss (có thể đã qua SSFP) để tính alignment loss
+            # qry_fts_orig[0,0] -> [C,Hf,Wf] (vì epi index vào batch dim của qry_fts_orig, mà B_qry=1)
+            # supp_fts[0,0,0] -> [C,Hf,Wf] (vì epi index vào batch dim của supp_fts, mà B_sup=1)
+            # fore_mask_orig[0,0,0] -> [H,W]
+            current_qry_fts_for_align = qry_fts_orig[0, 0] # Lấy feature của query_idx=0, batch_idx=0
+            current_pred_for_align = final_pred_for_loss[0] # Lấy prediction của query_idx=0 (B_qry=1)
+            
+            # Lấy cho way 0, shot 0, batch_idx=0 của support
+            current_supp_fts_for_align = supp_fts[0, 0, 0] 
+            current_fore_mask_for_align = fore_mask_orig[0, 0, 0]
+            current_back_mask_for_align = back_mask_orig[0, 0, 0]
 
-        pred_mask = pred.argmax(dim=1).unsqueeze(0)
-        binary_masks = [pred_mask == i for i in range(1 + n_ways)]
+            if DEBUG_SHAPES:
+                print(f"[DEBUG] AlignLoss input qry_fts.shape: {current_qry_fts_for_align.shape}")
+                print(f"[DEBUG] AlignLoss input pred.shape: {current_pred_for_align.shape}")
+                print(f"[DEBUG] AlignLoss input supp_fts.shape: {current_supp_fts_for_align.shape}")
+                print(f"[DEBUG] AlignLoss input fore_mask.shape: {current_fore_mask_for_align.shape}")
+            
+            align_loss_epi = self.alignLoss(current_qry_fts_for_align, current_pred_for_align,
+                                            current_supp_fts_for_align.unsqueeze(0).unsqueeze(0), # Thêm lại dim Way, Shot
+                                            current_fore_mask_for_align.unsqueeze(0).unsqueeze(0),# Thêm lại dim Way, Shot
+                                            current_back_mask_for_align.unsqueeze(0).unsqueeze(0))# Thêm lại dim Way, Shot
+            align_loss += align_loss_epi
+            if DEBUG_SHAPES: print(f"[DEBUG] align_loss_epi: {align_loss_epi.item() if isinstance(align_loss_epi, torch.Tensor) else align_loss_epi}")
+
+        output_final = torch.stack(outputs, dim=1)
+        if DEBUG_SHAPES: print(f"[DEBUG] output_final.shape (stacked): {output_final.shape}") # [N_queries, B_qry, Num_classes, H, W] -> [1,1,2,256,256]
+        output_final = output_final.view(-1, *output_final.shape[2:])
+        if DEBUG_SHAPES: print(f"[DEBUG] output_final.shape (viewed): {output_final.shape}") # [1,2,256,256]
+
+        final_assign_maps = torch.stack(assign_maps_list, dim=1) if assign_maps_list and assign_maps_list[0] is not None else None
+        final_bg_sim_maps = torch.stack(bg_sim_maps_list, dim=1) if show_viz and bg_sim_maps_list and bg_sim_maps_list[0] is not None else None
+        final_fg_sim_maps = torch.stack(fg_sim_maps_list, dim=1) if show_viz and fg_sim_maps_list and fg_sim_maps_list[0] is not None else None
+
+        if DEBUG_SHAPES:
+            print(f"[DEBUG] final_assign_maps.shape: {final_assign_maps.shape if final_assign_maps is not None else 'None'}")
+            print(f"[DEBUG] final_bg_sim_maps.shape: {final_bg_sim_maps.shape if final_bg_sim_maps is not None else 'None'}")
+            print(f"[DEBUG] final_fg_sim_maps.shape: {final_fg_sim_maps.shape if final_fg_sim_maps is not None else 'None'}")
+            print("--- Exiting FewShotSeg.forward (with SSFP logic) ---\n")
+        return output_final, align_loss / sup_bsize if sup_bsize > 0 else 0, [final_bg_sim_maps, final_fg_sim_maps], final_assign_maps
+
+
+    def alignLoss(self, qry_fts_single, pred_single, supp_fts_single_way_shot, fore_mask_single_way_shot, back_mask_single_way_shot):
+        """
+        Compute the loss for the prototype alignment branch.
+        Adjusted to receive single episode's data after batch processing.
+        Args:
+            qry_fts_single: embedding features for a single query image [C, H', W']
+            pred_single: predicted segmentation score for that query [Num_classes, H', W']
+            supp_fts_single_way_shot: embedding features for support images [Way, Shot, C, H', W']
+            fore_mask_single_way_shot: foreground masks for support images [Way, Shot, H, W]
+            back_mask_single_way_shot: background masks for support images [Way, Shot, H, W]
+        """
+        if DEBUG_SHAPES: print("\n  --- Entering alignLoss (modified for single episode) ---")
+        if DEBUG_SHAPES:
+            print(f"  [DEBUG] alignLoss initial qry_fts_single.shape: {qry_fts_single.shape}")
+            print(f"  [DEBUG] alignLoss initial pred_single.shape: {pred_single.shape}")
+            print(f"  [DEBUG] alignLoss initial supp_fts_single_way_shot.shape: {supp_fts_single_way_shot.shape}")
+            print(f"  [DEBUG] alignLoss initial fore_mask_single_way_shot.shape: {fore_mask_single_way_shot.shape}")
+            print(f"  [DEBUG] alignLoss initial back_mask_single_way_shot.shape: {back_mask_single_way_shot.shape}")
+
+        n_ways, n_shots = supp_fts_single_way_shot.shape[0], supp_fts_single_way_shot.shape[1]
+        if DEBUG_SHAPES: print(f"  [DEBUG] alignLoss n_ways: {n_ways}, n_shots: {n_shots}")
+
+        # pred_single is [Num_classes, H', W'] -> argmax over Num_classes dim (dim=0)
+        # Result of argmax is [H', W'].
+        # keepdim=True makes it [1, H', W'] (Num_classes_reduced, H', W')
+        # unsqueeze(0) makes it [1, 1, H', W'] (Batch_pred_mask, C_pred_mask, Hf, Wf)
+        pred_mask = pred_single.argmax(dim=0, keepdim=True).unsqueeze(0)
+        if DEBUG_SHAPES: print(f"  [DEBUG] pred_mask.shape (after argmax): {pred_mask.shape}") # Expected: [1, 1, H_feat, W_feat]
+
+        # binary_masks will be a list of [Batch_pred_mask(1), C_pred_mask(1), H_feat, W_feat] tensors
+        num_total_classes = pred_single.shape[0] # Should be 1 (BG) + n_ways (FG)
+        binary_masks = [pred_mask == i for i in range(num_total_classes)]
+        if DEBUG_SHAPES: print(f"  [DEBUG] len(binary_masks): {len(binary_masks)}, num_total_classes: {num_total_classes}, binary_masks[0].shape: {binary_masks[0].shape if len(binary_masks)>0 else '[]'}")
 
         skip_ways = []
-        qry_fts = qry_fts.unsqueeze(0).unsqueeze(2)
+
+        # qry_fts_single is [C, H', W']
+        # cls_unit expects sup_x: [Way_eff, Shot_eff, B_eff_s, C, Hf, Wf]
+        # Here, qry_fts_single acts as "support feature" for generating "query prototypes".
+        # Treat it as 1 way, 1 shot, 1 batch.
+        # qry_fts_single.unsqueeze(0) -> [1, C, Hf, Wf] (Shot_eff, C, Hf, Wf)
+        # qry_fts_single.unsqueeze(0).unsqueeze(0) -> [1, 1, C, Hf, Wf] (Way_eff, Shot_eff, C, Hf, Wf)
+        # qry_fts_single.unsqueeze(0).unsqueeze(0).unsqueeze(2) -> [1, 1, 1, C, Hf, Wf] (Way_eff, Shot_eff, B_eff_s, C, Hf, Wf)
+        reshaped_qry_fts_for_cls = qry_fts_single.unsqueeze(0).unsqueeze(0).unsqueeze(2)
+        if DEBUG_SHAPES: print(f"  [DEBUG] reshaped_qry_fts_for_cls for cls_unit.shape: {reshaped_qry_fts_for_cls.shape}") # Expected: [1,1,1,C,H',W']
 
         loss = []
-        for way in range(n_ways):
-            if way in skip_ways:
+        for way_idx in range(n_ways): # Iterates 0 to n_ways-1 (for FG ways)
+            if way_idx in skip_ways:
                 continue
-            for shot in range(n_shots):
-                img_fts = supp_fts[way: way + 1, shot: shot + 1]
-                qry_pred_fg_msk = F.interpolate(binary_masks[way + 1].float(), size=img_fts.shape[-2:], mode='bilinear')
-                qry_pred_bg_msk = F.interpolate(binary_masks[0].float(), size=img_fts.shape[-2:], mode='bilinear')
-                scores = []
+            if DEBUG_SHAPES: print(f"    [DEBUG] alignLoss - Way: {way_idx}")
+            for shot_idx in range(n_shots):
+                if DEBUG_SHAPES: print(f"      [DEBUG] alignLoss - Shot: {shot_idx}")
+                # img_fts_align: current support feature to segment. Shape [C, H', W']
+                img_fts_align = supp_fts_single_way_shot[way_idx, shot_idx]
+                # cls_unit qry (query input): [Way_eff_q, B_eff_q, C, Hf, Wf]
+                # Here, img_fts_align is the query. Treat as 1 Way, 1 Batch.
+                img_fts_for_cls_qry = img_fts_align.unsqueeze(0).unsqueeze(0) # [1(Way_q),1(B_q),C,H',W']
+                if DEBUG_SHAPES: print(f"      [DEBUG] img_fts_for_cls_qry.shape: {img_fts_for_cls_qry.shape}")
 
-                _raw_score_bg, _, _ = self.cls_unit(qry=img_fts, sup_x=qry_fts, sup_y=qry_pred_bg_msk.unsqueeze(-3), mode=BG_PROT_MODE, thresh=BG_THRESH)
-                scores.append(_raw_score_bg)
+                # Prepare sup_y for cls_unit: [Way_eff_s, Shot_eff_s, B_eff_s, Hf, Wf]
+                # binary_masks[0].float() is [Batch_pred_mask(1), C_pred_mask(1), Hf, Wf]
+                # After interpolate: still [1, 1, Hf, Wf]
+                # .squeeze(1) removes C_pred_mask dim: [Batch_pred_mask(1), Hf, Wf]
+                # .unsqueeze(0).unsqueeze(0) adds Way_eff_s=1, Shot_eff_s=1:
+                # results in [Way(1), Shot(1), Batch_pred_mask(1), Hf, Wf]
 
-                _raw_score_fg, _, _ = self.cls_unit(qry=img_fts, sup_x=qry_fts, sup_y=qry_pred_fg_msk.unsqueeze(-3), mode=FG_PROT_MODE, thresh=FG_THRESH)
-                scores.append(_raw_score_fg)
+                bg_mask_interpolated = F.interpolate(binary_masks[0].float(), size=img_fts_align.shape[-2:], mode='bilinear')
+                # binary_masks index for FG way: way_idx + 1 (because index 0 is BG)
+                fg_mask_interpolated = F.interpolate(binary_masks[way_idx + 1].float(), size=img_fts_align.shape[-2:], mode='bilinear')
 
-                supp_pred = torch.cat(scores, dim=1)
-                supp_pred = F.interpolate(supp_pred, size=fore_mask.shape[-2:], mode='bilinear')
+                bg_mask_for_pool = bg_mask_interpolated.squeeze(1) # [Batch_pred_mask(1), Hf, Wf]
+                fg_mask_for_pool = fg_mask_interpolated.squeeze(1) # [Batch_pred_mask(1), Hf, Wf]
 
-                supp_label = torch.full_like(fore_mask[way, shot], 255, device=img_fts.device).long()
-                supp_label[fore_mask[way, shot] == 1] = 1
-                supp_label[back_mask[way, shot] == 1] = 0
-                loss.append(F.cross_entropy(supp_pred, supp_label[None, ...], ignore_index=255) / n_shots / n_ways)
+                qry_pred_bg_msk_for_cls = bg_mask_for_pool.unsqueeze(0).unsqueeze(0) # [Way(1),Shot(1),B_pred(1),Hf,Wf]
+                qry_pred_fg_msk_for_cls = fg_mask_for_pool.unsqueeze(0).unsqueeze(0) # [Way(1),Shot(1),B_pred(1),Hf,Wf]
 
-        return torch.sum(torch.stack(loss))
+                if DEBUG_SHAPES:
+                    print(f"      [DEBUG] Corrected qry_pred_bg_msk_for_cls.shape: {qry_pred_bg_msk_for_cls.shape}") # Expected: [1,1,1,Hf,Wf]
+                    print(f"      [DEBUG] Corrected qry_pred_fg_msk_for_cls.shape: {qry_pred_fg_msk_for_cls.shape}") # Expected: [1,1,1,Hf,Wf]
+
+                scores_align = []
+                if DEBUG_SHAPES: print(f"      [DEBUG] Calling cls_unit for BACKGROUND in alignLoss...")
+                # qry: [1,1,C,Hf,Wf], sup_x: [1,1,1,C,Hf,Wf], sup_y: [1,1,1,Hf,Wf]
+                _raw_score_bg_align, _, _ = self.cls_unit(qry=img_fts_for_cls_qry, sup_x=reshaped_qry_fts_for_cls, sup_y=qry_pred_bg_msk_for_cls, mode=BG_PROT_MODE, thresh=BG_THRESH, isval=False, val_wsize=None) # isval and val_wsize should be passed if needed
+                scores_align.append(_raw_score_bg_align)
+                if DEBUG_SHAPES: print(f"      [DEBUG] Align BG _raw_score_bg_align.shape: {_raw_score_bg_align.shape if _raw_score_bg_align is not None else 'None'}")
+
+
+                if DEBUG_SHAPES: print(f"      [DEBUG] Calling cls_unit for FOREGROUND in alignLoss...")
+                # For F.avg_pool2d(fg_mask_for_pool, 4), fg_mask_for_pool [B_pred(1), Hf, Wf] needs a channel dim
+                # It should be [B_pred(1), 1, Hf, Wf]
+                mode_fg_align = FG_PROT_MODE if F.avg_pool2d(fg_mask_for_pool.unsqueeze(1), 4).max() >= FG_THRESH and FG_PROT_MODE != 'mask' else 'mask'
+                _raw_score_fg_align, _, _ = self.cls_unit(qry=img_fts_for_cls_qry, sup_x=reshaped_qry_fts_for_cls, sup_y=qry_pred_fg_msk_for_cls, mode=mode_fg_align, thresh=FG_THRESH, isval=False, val_wsize=None)
+                scores_align.append(_raw_score_fg_align)
+                if DEBUG_SHAPES: print(f"      [DEBUG] Align FG _raw_score_fg_align.shape: {_raw_score_fg_align.shape if _raw_score_fg_align is not None else 'None'}")
+
+
+                # scores_align contains [bg_score, fg_score_for_current_way]
+                # Each score is [B_eff_q(1), 1_score_channel, Hf, Wf]
+                supp_pred_align = torch.cat(scores_align, dim=1) # [B_eff_q(1), 2_classes (BG, current FG), Hf, Wf]
+                if DEBUG_SHAPES: print(f"      [DEBUG] supp_pred_align.shape (align loss scores concat): {supp_pred_align.shape}")
+                
+                # Interpolate to original support mask size
+                # fore_mask_single_way_shot shape is [Way, Shot, H, W]
+                orig_mask_H, orig_mask_W = fore_mask_single_way_shot.shape[-2:]
+                supp_pred_align = F.interpolate(supp_pred_align, size=(orig_mask_H, orig_mask_W), mode='bilinear')
+                if DEBUG_SHAPES: print(f"      [DEBUG] supp_pred_align.shape (align loss scores interpolated): {supp_pred_align.shape}") # [1,2,H,W]
+
+                # Construct the support Ground-Truth segmentation for the current support image
+                # fore_mask_single_way_shot[way_idx, shot_idx] is [H, W]
+                supp_label = torch.full_like(fore_mask_single_way_shot[way_idx, shot_idx], 255,
+                                             device=img_fts_align.device).long()
+                # For alignment loss, the "foreground" class is always 1, and "background" is 0
+                # relative to the specific support image being reconstructed.
+                supp_label[fore_mask_single_way_shot[way_idx, shot_idx] == 1] = 1 # Class 1 is the FG of this support
+                supp_label[back_mask_single_way_shot[way_idx, shot_idx] == 1] = 0 # Class 0 is the BG of this support
+                if DEBUG_SHAPES: print(f"      [DEBUG] supp_label.shape: {supp_label.shape}, unique values: {torch.unique(supp_label)}")
+                
+                # Compute Loss
+                # supp_pred_align is [B_eff_q(1), 2_classes, H, W]
+                # supp_label is [H, W], needs unsqueeze(0) for batch dim for cross_entropy
+                current_loss = F.cross_entropy(
+                    supp_pred_align, supp_label.unsqueeze(0), ignore_index=255)
+                
+                # Normalize by n_shots and n_ways if this is part of a larger averaging scheme
+                # Based on original code, it was / n_shots / n_ways
+                # However, since this function now processes one (way,shot) effectively for alignment's target,
+                # the normalization might be handled outside or differently.
+                # For now, let's keep it as per the original structure's intent for an item's contribution.
+                if n_shots > 0 and n_ways > 0:
+                    current_loss = current_loss / (n_shots * n_ways)
+                
+                loss.append(current_loss)
+                if DEBUG_SHAPES: print(f"      [DEBUG] Align current_loss: {current_loss.item()}")
+
+        total_align_loss = torch.sum(torch.stack(loss)) if loss else torch.tensor(0.0, device=qry_fts_single.device)
+        if DEBUG_SHAPES:
+            print(f"  [DEBUG] Total align_loss for episode: {total_align_loss.item()}")
+            print("  --- Exiting alignLoss (modified) ---")
+        return total_align_loss

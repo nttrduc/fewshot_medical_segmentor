@@ -22,7 +22,7 @@ EXCLU='[2,3]' # setting 2: excluding kidneies in training set to test generaliza
 
 ###### Training configs ######
 NSTEP=100100
-DECAY=0.95
+DECAY=0.85
 
 MAX_ITER=1000 # defines the size of an epoch
 SNAPSHOT_INTERVAL=25000 # interval for saving snapshot
@@ -47,7 +47,7 @@ do
     fi
 
     python3 training.py with \
-    'modelname=dlfcn_res101' \
+    'modelname=mobine_net' \
     'usealign=True' \
     'optim_type=sgd' \
     num_workers=$NWORKER \
