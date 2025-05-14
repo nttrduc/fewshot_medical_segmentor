@@ -9,7 +9,7 @@ import numpy as np
 from pdb import set_trace
 import matplotlib.pyplot as plt
 # for unit test from spatial_similarity_module import NONLocalBlock2D, LayerNorm
-
+import time
 class MultiProtoAsConv(nn.Module):
     def __init__(self, proto_grid, feature_hw, upsample_mode = 'bilinear'):
         """
@@ -81,8 +81,7 @@ class MultiProtoAsConv(nn.Module):
 
             protos = n_sup_x[sup_y_g > thresh, :] # npro, nc
             pro_n = safe_norm(protos)
-            qry_n = safe_norm(qry)
-
+            qry_n = safe_norm(qry)           
             dists = F.conv2d(qry_n, pro_n[..., None, None]) * 20
 
             pred_grid = torch.sum(F.softmax(dists, dim = 1) * dists, dim = 1, keepdim = True)

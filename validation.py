@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import MultiStepLR
 import torch.backends.cudnn as cudnn
 import numpy as np
-
+import time
 from models.grid_proto_fewshot import FewShotSeg
 
 from dataloaders.dev_customized_med import med_fewshot_val
@@ -44,9 +44,9 @@ def main(_run, _config, _log):
     cudnn.enabled = True
     cudnn.benchmark = True
     torch.cuda.set_device(device=_config['gpu_id'])
-    torch.set_num_threads(1)
+    # torch.set_num_threads(1)
     
-    snapshots_dir = "/root/ducnt/fewshot_medical_segmentor/exps/myexperiments_MIDDLE_0/mySSL_train_CHAOST2_Superpix_lbgroup0_scale_MIDDLE_vfold0_CHAOST2_Superpix_sets_0_1shot/73/snapshots"
+    snapshots_dir = "/root/ducnt/fewshot_medical_segmentor/exps/myexp_MIDDLE_0/mySSL_train_SABS_Superpix_lbgroup0_scale_MIDDLE_vfold0_SABS_Superpix_sets_0_1shot/29/snapshots"
 
 # List tất cả các file .pth trong thư mục snapshots
     weight_files = [f for f in os.listdir(snapshots_dir) if f.endswith('.pth')]
@@ -70,7 +70,7 @@ def main(_run, _config, _log):
         model = FewShotSeg(pretrained_path = pretrained_path, cfg=_config['model'], backbone=backbone)
         model = model.cuda()
         model.eval()
-        total_params = model.encoder.total_params
+        # total_params = model.encoder.total_params
         _log.info('###### Load data ######')
         ### Training set
         data_name = _config['dataset']
@@ -148,6 +148,8 @@ def main(_run, _config, _log):
         with torch.no_grad():
             save_pred_buffer = {} # indexed by class
 
+            _log.info('###### Start validation ######')
+            start_time = time.time()
             for curr_lb in test_labels:
                 te_dataset.set_curr_cls(curr_lb)
                 support_batched = te_parent.get_support(curr_class = curr_lb, class_idx = [curr_lb], scan_idx = _config["support_idx"], npart=_config['task']['npart'])
@@ -218,7 +220,19 @@ def main(_run, _config, _log):
                     sitk.WriteImage(itk_pred, fid, True)
                     # _log.info(f'###### {fid} has been saved ######')
 
-            del save_pred_buffer
+# Đo thời gian kết thúc
+            end_time = time.time()
+
+            # Tính toán thời gian chạy và số ảnh inference trong mỗi giây
+            elapsed_time = end_time - start_time
+            total_images = len(testloader)  # Tổng số ảnh đã inference
+
+            # Tính số ảnh mỗi giây
+            images_per_second = total_images / elapsed_time
+
+            print(f"Processed {total_images} images in {elapsed_time:.2f} seconds.")
+            print(f"Images per second: {images_per_second:.2f}")
+        del save_pred_buffer
 
         del sample_batched, support_images, support_bg_mask, query_images, query_labels, query_pred
 
@@ -261,9 +275,9 @@ def main(_run, _config, _log):
 
         # Nếu file chưa tồn tại thì ghi header
         write_header = not os.path.exists(csv_path)
-
+        
         # Dòng dữ liệu mới
-        row = ["mobilenet_v2_slic_sam2_V2"]  # Tên backbone kèm epoch, ví dụ: epoch5000_backbone_densenet121.pth
+        row = [f"{weight_file}_ct_resnet101_sam_slic_alpha_0.8_for_3"]  # Tên backbone kèm epoch, ví dụ: epoch5000_backbone_densenet121.pth
 
         # Thêm Dice 4 cơ quan + mean
         row += [round(x.item(), 4) for x in m_classDice] + [round(m_meanDice.item(), 4)]
@@ -274,7 +288,7 @@ def main(_run, _config, _log):
         # Thêm Recall 4 cơ quan + mean
         row += [round(x.item(), 4) for x in m_classRec] + [round(m_meanRec.item(), 4)]
 
-        row += [total_params]
+        row += [10]
         # Ghi vào file CSV
         with open(csv_path, mode='a', newline='') as f:
             writer = csv.writer(f)

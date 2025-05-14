@@ -28,7 +28,7 @@ DECAY=0.95 # learning rate decay
 
 MAX_ITER=1400 # defines the size of an epoch
 SNAPSHOT_INTERVAL=5000 # interval for saving snapshot
-SEED='1'
+SEED='1234'
 
 ###### Validation configs ######
 SUPP_ID='[4]' #  # using the additionally loaded scan as support
@@ -49,7 +49,7 @@ do
     fi
 
     python3 training.py with \
-    'modelname=dlfcn_res101' \
+    'modelname=mobile' \
     'usealign=True' \
     'optim_type=sgd' \
     num_workers=$NWORKER \

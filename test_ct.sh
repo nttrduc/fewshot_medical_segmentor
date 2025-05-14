@@ -49,7 +49,7 @@ do
     RELOAD_PATH='/root/ducnt/fewshot_medical_segmentor/exps/myexp_MIDDLE_0/mySSL_train_SABS_Superpix_lbgroup0_scale_MIDDLE_vfold0_SABS_Superpix_sets_0_1shot/3/snapshots/slic_sam2_res101_alp_contras_low_high_epoch_32000.pth' # path to the reloaded model
 
     python3 validation.py with \
-    'modelname=dlfcn_res101' \
+    'modelname=resnet' \
     'usealign=True' \
     'optim_type=sgd' \
     reload_model_path=$RELOAD_PATH \

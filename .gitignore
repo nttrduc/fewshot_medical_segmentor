@@ -10,10 +10,13 @@ models/backbone/SAM2_UNet
 # C extensions
 *.so
 *.pth
+*.png 
+
 # Distribution / packaging
 .Python
 build/
-data/
+data/SABS/CT/
+data/SABS/sabs_CT_normalized_sam/
 data_sam2/
 chaos_MR_T2_normalized/
 develop-eggs/

@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 from .alpmodule import MultiProtoAsConv # Giữ nguyên module này
 from .backbone.torchvision_backbones import BackboneEncode
+from .backbone.torchvision_backbones import TVDeeplabRes101Encoder
 # DEBUG
 from pdb import set_trace
 
@@ -44,8 +45,7 @@ class FewShotSeg(nn.Module):
 
         # SSFP specific configs
         self.use_ssfp = self.config.get('use_ssfp', False)
-        self.ssfp_confidence_thresh = self.config.get('ssfp_confidence_thresh', 0.7)
-        self.ssfp_alpha_P_star = self.config.get('ssfp_alpha_P_star', 0.5) # alpha1 cho Ps_sp
+
 
         if DEBUG_SHAPES and self.use_ssfp:
             print(f"[DEBUG] SSFP Enabled: use_ssfp={self.use_ssfp}, "
@@ -56,14 +56,20 @@ class FewShotSeg(nn.Module):
         self.get_cls()
 
     def get_encoder(self, in_channels):
-        if self.config['which_model'] == 'dlfcn_res101':
+        if self.config['which_model'] == 'mobile':
             self.encoder = BackboneEncode(backbone=self.backbone)
             if DEBUG_SHAPES: print(f"[DEBUG] Encoder: BackboneEncode initialized.")
+        elif self.config['which_model'] == 'resnet':
+            self.encoder = TVDeeplabRes101Encoder(use_coco_init=True)
+            print("###### Backbone resnet101: Using ms-coco initialization ######")
         else:
             raise NotImplementedError(f'Backbone network {self.config["which_model"]} not implemented')
-
+        # if 1 == 1:
         if self.pretrained_path:
-            self.load_state_dict(torch.load(self.pretrained_path), strict=False)
+            state_dict = torch.load(self.pretrained_path)
+            self.load_state_dict(state_dict, strict=False)
+            # self.load_state_dict(torch.load("/root/ducnt/fewshot_medical_segmentor/exps/myexperiments_MIDDLE_0/mySSL_train_CHAOST2_Superpix_lbgroup0_scale_MIDDLE_vfold0_CHAOST2_Superpix_sets_0_1shot/17/snapshots/epoch72000_mit_b0_0.053_0.043.pth"), strict=False)
+            # self.load_state_dict(torch.load(self.pretrained_path), strict=False)
             print(f'###### Pre-trained model f{self.pretrained_path} has been loaded ######')
 
     def get_cls(self):
@@ -136,6 +142,7 @@ class FewShotSeg(nn.Module):
         if DEBUG_SHAPES: print(f"[DEBUG] imgs_concat.shape: {imgs_concat.shape}") # [2,3,256,256]
 
         img_fts = self.encoder(imgs_concat, low_level = False)
+        
         fts_size = img_fts.shape[-2:]
         if DEBUG_SHAPES: print(f"[DEBUG] img_fts.shape: {img_fts.shape}, fts_size: {fts_size}") # [2,C_feat,16,16]
 
@@ -210,110 +217,142 @@ class FewShotSeg(nn.Module):
         final_pred_for_loss = initial_pred # Mặc định
 
         # ---- QESP Logic (Query-Enriched Support Feature Map) ----
-        if self.config.get('use_qesp', True):
+# ---- QESP Logic (Query-Enriched Support Feature Map) ----
+        if self.config.get('use_qesp', False):
             if DEBUG_SHAPES: print(f"[DEBUG] --- Applying QESP (Feature Map Update) ---")
-            # initial_pred shape: [B_qry, Num_classes (BG+FG), Hf, Wf] -> [1, 2, 16, 16]
-            # current_qry_fts shape: [B_qry, C, Hf, Wf] -> [1, C_feat, 16, 16]
-
-            # 1. Gán nhãn Pixel trên Query và tạo Global Prototypes từ Query
-            query_pixel_labels = initial_pred.argmax(dim=1) # [B_qry, Hf, Wf] -> [1, 16, 16]
-            query_fg_pixel_mask = (query_pixel_labels == 1).float().unsqueeze(1) # [B_qry, 1, Hf, Wf]
-            query_bg_pixel_mask = (query_pixel_labels == 0).float().unsqueeze(1) # [B_qry, 1, Hf, Wf]
-
-            Pq_fg_global_norm = None
-            if query_fg_pixel_mask.sum() > 0:
-                pq_fg_temp = self._generate_map_prototype(current_qry_fts, query_fg_pixel_mask) # [B_qry, C] or [C]
-                Pq_fg_global_norm = self._safe_norm_prototype(pq_fg_temp)
-                if DEBUG_SHAPES: print(f"[DEBUG] QESP: Pq_fg_global_norm.shape: {Pq_fg_global_norm.shape if Pq_fg_global_norm is not None else 'None'}")
             
-            Pq_bg_global_norm = None
-            if query_bg_pixel_mask.sum() > 0:
-                pq_bg_temp = self._generate_map_prototype(current_qry_fts, query_bg_pixel_mask) # [B_qry, C] or [C]
-                Pq_bg_global_norm = self._safe_norm_prototype(pq_bg_temp)
-                if DEBUG_SHAPES: print(f"[DEBUG] QESP: Pq_bg_global_norm.shape: {Pq_bg_global_norm.shape if Pq_bg_global_norm is not None else 'None'}")
+            # Bắt đầu với dự đoán ban đầu và đặc trưng support gốc
+            current_prediction_for_qesp = initial_pred 
+            # current_support_features_for_qesp giữ nguyên shape [Way, Shot, B_sup, C, Hf, Wf]
+            current_support_features_for_qesp = supp_fts.clone() # Tạo bản sao để tránh thay đổi supp_fts gốc ngoài ý muốn
 
-            # 2. Chuẩn bị Support Feature Map và Masks Gốc
-            #    supp_fts: [Way, Shot, B_sup, C, Hf, Wf] -> [1,1,1,C,16,16]
-            #    res_fg_msk / res_bg_msk: [Way, Shot, B_sup, Hf, Wf] -> [1,1,1,16,16]
-            #    Ta sẽ làm việc với slice [0,0,0] vì Way, Shot, B_sup đều là 1
+            # Lặp 3 lần cho QESP
+            num_qesp_iterations = 3
+            for i in range(num_qesp_iterations):
+                if DEBUG_SHAPES: print(f"\n[DEBUG] QESP Iteration {i+1}/{num_qesp_iterations}")
+
+                # ---- Bước 1: Tạo Prototypes từ Query dựa trên dự đoán *hiện tại* ----
+                # Sử dụng current_prediction_for_qesp từ vòng lặp trước (hoặc initial_pred cho i=0)
+                bg_scores_query = current_prediction_for_qesp[:, 0, :, :] # [B_qry, Hf, Wf]
+                fg_scores_query = current_prediction_for_qesp[:, 1, :, :] # [B_qry, Hf, Wf]
+
+                # --- Lọc bằng Trung vị ---
+                query_fg_pixel_mask = torch.zeros_like(fg_scores_query).unsqueeze(1) # Khởi tạo mặt nạ rỗng
+                if fg_scores_query.numel() > 0 :
+                    fg_median_threshold = torch.median(fg_scores_query.view(fg_scores_query.shape[0], -1), dim=1).values
+                    fg_threshold_query_median = fg_median_threshold.unsqueeze(-1).unsqueeze(-1)
+                    query_fg_pixel_mask = (fg_scores_query >= fg_threshold_query_median).float().unsqueeze(1) # [B_qry, 1, Hf, Wf]
+                    if DEBUG_SHAPES:
+                        print(f"[DEBUG] QESP Iter {i+1}: fg_median_threshold.shape: {fg_median_threshold.shape}, example value: {fg_median_threshold[0].item() if fg_scores_query.numel() > 0 else 'N/A'}")
+                else:
+                    if DEBUG_SHAPES: print(f"[DEBUG] QESP Iter {i+1}: fg_scores_query is empty.")
+
+                query_bg_pixel_mask = torch.zeros_like(bg_scores_query).unsqueeze(1) # Khởi tạo mặt nạ rỗng
+                if bg_scores_query.numel() > 0:
+                    bg_median_threshold = torch.median(bg_scores_query.view(bg_scores_query.shape[0], -1), dim=1).values
+                    bg_threshold_query_median = bg_median_threshold.unsqueeze(-1).unsqueeze(-1)
+                    query_bg_pixel_mask = (bg_scores_query >= bg_threshold_query_median).float().unsqueeze(1) # [B_qry, 1, Hf, Wf]
+                    if DEBUG_SHAPES:
+                        print(f"[DEBUG] QESP Iter {i+1}: bg_median_threshold.shape: {bg_median_threshold.shape}, example value: {bg_median_threshold[0].item() if bg_scores_query.numel() > 0 else 'N/A'}")
+                else:
+                     if DEBUG_SHAPES: print(f"[DEBUG] QESP Iter {i+1}: bg_scores_query is empty.")
+
+                if DEBUG_SHAPES:
+                    print(f"[DEBUG] QESP Iter {i+1}: query_fg_pixel_mask (median).shape: {query_fg_pixel_mask.shape}, sum: {query_fg_pixel_mask.sum()}")
+                    print(f"[DEBUG] QESP Iter {i+1}: query_bg_pixel_mask (median).shape: {query_bg_pixel_mask.shape}, sum: {query_bg_pixel_mask.sum()}")
+
+                # --- Tạo prototype query toàn cục ---
+                Pq_fg_global_norm = None
+                if query_fg_pixel_mask.sum() > 0:
+                    # Sử dụng đặc trưng query gốc (không thay đổi qua các vòng lặp QESP)
+                    pq_fg_temp = self._generate_map_prototype(current_qry_fts, query_fg_pixel_mask) 
+                    Pq_fg_global_norm = self._safe_norm_prototype(pq_fg_temp)
+                    if DEBUG_SHAPES: print(f"[DEBUG] QESP Iter {i+1}: Pq_fg_global_norm.shape: {Pq_fg_global_norm.shape if Pq_fg_global_norm is not None else 'None'}")
+                
+                Pq_bg_global_norm = None
+                if query_bg_pixel_mask.sum() > 0:
+                    pq_bg_temp = self._generate_map_prototype(current_qry_fts, query_bg_pixel_mask)
+                    Pq_bg_global_norm = self._safe_norm_prototype(pq_bg_temp)
+                    if DEBUG_SHAPES: print(f"[DEBUG] QESP Iter {i+1}: Pq_bg_global_norm.shape: {Pq_bg_global_norm.shape if Pq_bg_global_norm is not None else 'None'}")
+
+                # ---- Bước 2: Chuẩn bị Đặc trưng Support *hiện tại* ----
+                # Sử dụng current_support_features_for_qesp từ vòng lặp trước (hoặc supp_fts gốc cho i=0)
+                # Lấy slice [0,0,0] vì Way, Shot, B_sup đều là 1
+                supp_fts_slice_this_iter = current_support_features_for_qesp[0, 0, 0].clone() # [C, Hf, Wf]
+                # Mặt nạ support gốc không thay đổi
+                res_fg_msk_slice = res_fg_msk[0, 0, 0]     # [Hf, Wf]
+                res_bg_msk_slice = res_bg_msk[0, 0, 0]     # [Hf, Wf]
+
+                if DEBUG_SHAPES:
+                    print(f"[DEBUG] QESP Iter {i+1}: supp_fts_slice_this_iter.shape: {supp_fts_slice_this_iter.shape}")
+                    print(f"[DEBUG] QESP Iter {i+1}: res_fg_msk_slice.shape: {res_fg_msk_slice.shape}")
+
+                # ---- Bước 3: Cập nhật Đặc trưng Support ----
+                # Sử dụng supp_fts_slice_this_iter và các prototype query MỚI (Pq_fg/bg_global_norm)
+                alpha_fg = self.config.get('qesp_alpha_update', 0.8)
+                alpha_bg = self.config.get('qesp_alpha_update', 0.8)
+                updated_supp_fts_slice_this_iter = supp_fts_slice_this_iter.clone() # Tạo bản sao để cập nhật
+
+                # Cập nhật vùng FG
+                if Pq_fg_global_norm is not None:
+                    pq_fg_to_use = Pq_fg_global_norm[0] if Pq_fg_global_norm.ndim == 2 else Pq_fg_global_norm # Shape [C]
+                    fg_mask_for_update = res_fg_msk_slice.unsqueeze(0) # [1, Hf, Wf]
+                    original_fg_features_support = supp_fts_slice_this_iter * fg_mask_for_update
+                    updated_fg_part = alpha_fg * original_fg_features_support + \
+                                    (1.0 - alpha_fg) * pq_fg_to_use.unsqueeze(-1).unsqueeze(-1)
+                    updated_supp_fts_slice_this_iter = torch.where(fg_mask_for_update.bool(), updated_fg_part, updated_supp_fts_slice_this_iter)
+                    if DEBUG_SHAPES: print(f"[DEBUG] QESP Iter {i+1}: FG features in support map updated.")
+
+                # Cập nhật vùng BG
+                if Pq_bg_global_norm is not None:
+                    pq_bg_to_use = Pq_bg_global_norm[0] if Pq_bg_global_norm.ndim == 2 else Pq_bg_global_norm # Shape [C]
+                    bg_mask_for_update = res_bg_msk_slice.unsqueeze(0) # [1, Hf, Wf]
+                    original_bg_features_support = supp_fts_slice_this_iter * bg_mask_for_update
+                    updated_bg_part = alpha_bg * original_bg_features_support + \
+                                    (1.0 - alpha_bg) * pq_bg_to_use.unsqueeze(-1).unsqueeze(-1)
+                    updated_supp_fts_slice_this_iter = torch.where(bg_mask_for_update.bool(), updated_bg_part, updated_supp_fts_slice_this_iter)
+                    if DEBUG_SHAPES: print(f"[DEBUG] QESP Iter {i+1}: BG features in support map updated.")
+
+                # ---- Chuẩn bị đặc trưng support đã cập nhật cho vòng lặp tiếp theo ----
+                # Đưa về shape [Way, Shot, B_sup, C, Hf, Wf]
+                supp_fts_updated_for_next_iter = updated_supp_fts_slice_this_iter.unsqueeze(0).unsqueeze(0).unsqueeze(0)
+                if DEBUG_SHAPES: print(f"[DEBUG] QESP Iter {i+1}: supp_fts_updated_for_next_iter.shape: {supp_fts_updated_for_next_iter.shape}")
+
+                # ---- Bước 4: Tính Score Lần Nữa với Đặc trưng Support Đã Cập Nhật ----
+                # Sử dụng đặc trưng query gốc (current_qry_fts) và đặc trưng support MỚI (supp_fts_updated_for_next_iter)
+                # Mặt nạ support gốc (res_fg_msk, res_bg_msk) vẫn dùng để xác định vùng pooling trong cls_unit
+                final_scores_list_qesp = []
+
+                if DEBUG_SHAPES: print(f"[DEBUG] QESP Iter {i+1}: Recalculating scores with updated support features...")
+                # Gọi cls_unit với supp_fts_updated_for_next_iter
+                bg_score_qesp, _, _ = self.cls_unit(current_qry_fts, supp_fts_updated_for_next_iter, res_bg_msk, 
+                                                mode=BG_PROT_MODE, thresh=BG_THRESH, 
+                                                isval=isval, val_wsize=val_wsize, vis_sim=False)
+                final_scores_list_qesp.append(bg_score_qesp)
+                if DEBUG_SHAPES: print(f"[DEBUG] QESP Iter {i+1}: New BG score shape: {bg_score_qesp.shape if bg_score_qesp is not None else 'None'}")
+
+                current_res_fg_msk_for_way0 = res_fg_msk[0] # Vẫn dùng mặt nạ gốc để check mode
+                fg_score_qesp, _, _ = self.cls_unit(current_qry_fts, supp_fts_updated_for_next_iter, res_fg_msk,
+                                                mode=FG_PROT_MODE if F.avg_pool2d(current_res_fg_msk_for_way0, 4).max() >= FG_THRESH and FG_PROT_MODE != 'mask' else 'mask',
+                                                thresh=FG_THRESH, isval=isval, val_wsize=val_wsize, vis_sim=False)
+                final_scores_list_qesp.append(fg_score_qesp)
+                if DEBUG_SHAPES: print(f"[DEBUG] QESP Iter {i+1}: New FG score shape: {fg_score_qesp.shape if fg_score_qesp is not None else 'None'}")
+                
+                # ---- Lưu kết quả dự đoán và đặc trưng support cho vòng lặp tiếp theo ----
+                new_prediction = torch.cat(final_scores_list_qesp, dim=1) # [B_qry, 2, Hf, Wf]
+                current_prediction_for_qesp = new_prediction
+                current_support_features_for_qesp = supp_fts_updated_for_next_iter # Quan trọng: cập nhật đặc trưng support
+
+                if DEBUG_SHAPES: print(f"[DEBUG] QESP Iter {i+1}: Updated current_prediction_for_qesp shape: {current_prediction_for_qesp.shape}")
+
+            # ---- Sau khi kết thúc vòng lặp QESP ----
+            # Dự đoán cuối cùng là kết quả từ vòng lặp cuối
+            final_pred_for_loss = current_prediction_for_qesp 
+            if DEBUG_SHAPES: print(f"[DEBUG] QESP: final_pred_for_loss.shape (after {num_qesp_iterations} iterations): {final_pred_for_loss.shape}")
             
-            supp_fts_slice = supp_fts[0, 0, 0].clone() # [C, Hf, Wf] -> [C,16,16]
-            res_fg_msk_slice = res_fg_msk[0, 0, 0]     # [Hf, Wf] -> [16,16] (không có channel)
-            res_bg_msk_slice = res_bg_msk[0, 0, 0]     # [Hf, Wf] -> [16,16]
-
-            if DEBUG_SHAPES:
-                print(f"[DEBUG] QESP: supp_fts_slice.shape: {supp_fts_slice.shape}")
-                print(f"[DEBUG] QESP: res_fg_msk_slice.shape: {res_fg_msk_slice.shape}")
-
-            # 3. Cập nhật các Feature Vector trong `supp_fts_slice`
-            alpha = self.config.get('qesp_alpha_update', 0.5)
-            updated_supp_fts_slice = supp_fts_slice.clone() # Tạo bản sao để cập nhật
-
-            # Cập nhật các vùng FG của support feature map
-            if Pq_fg_global_norm is not None:
-                # Pq_fg_global_norm có thể là [C] hoặc [B_qry, C]. Ta dùng [C] (vì B_qry=1)
-                pq_fg_to_use = Pq_fg_global_norm[0] if Pq_fg_global_norm.ndim == 2 else Pq_fg_global_norm # Shape [C]
-                
-                # Lặp qua từng pixel/vector của supp_fts_slice
-                # res_fg_msk_slice là [Hf, Wf]. Ta cần nó ở dạng [1, Hf, Wf] để nhân với [C, Hf, Wf]
-                fg_mask_for_update = res_fg_msk_slice.unsqueeze(0) # [1, Hf, Wf]
-                
-                # Lấy các feature vector thuộc FG trên support
-                original_fg_features_support = supp_fts_slice * fg_mask_for_update # [C, Hf, Wf], các vùng BG thành 0
-                
-                # Cập nhật: original_feature * alpha + query_global_proto * (1-alpha)
-                # pq_fg_to_use.unsqueeze(-1).unsqueeze(-1) -> [C, 1, 1] để broadcast với [C, Hf, Wf]
-                updated_fg_part = alpha * original_fg_features_support + \
-                                  (1.0 - alpha) * pq_fg_to_use.unsqueeze(-1).unsqueeze(-1)
-                
-                # Chỉ cập nhật những vị trí thuộc FG
-                updated_supp_fts_slice = torch.where(fg_mask_for_update.bool(), updated_fg_part, updated_supp_fts_slice)
-                if DEBUG_SHAPES: print(f"[DEBUG] QESP: FG features in support map updated.")
-
-            # Cập nhật các vùng BG của support feature map
-            if Pq_bg_global_norm is not None:
-                pq_bg_to_use = Pq_bg_global_norm[0] if Pq_bg_global_norm.ndim == 2 else Pq_bg_global_norm # Shape [C]
-                bg_mask_for_update = res_bg_msk_slice.unsqueeze(0) # [1, Hf, Wf]
-                original_bg_features_support = supp_fts_slice * bg_mask_for_update
-                updated_bg_part = alpha * original_bg_features_support + \
-                                  (1.0 - alpha) * pq_bg_to_use.unsqueeze(-1).unsqueeze(-1)
-                updated_supp_fts_slice = torch.where(bg_mask_for_update.bool(), updated_bg_part, updated_supp_fts_slice)
-                if DEBUG_SHAPES: print(f"[DEBUG] QESP: BG features in support map updated.")
-
-            # Tạo supp_fts_new và các mask gốc (res_fg_msk, res_bg_msk không đổi vì hình dạng support không đổi)
-            # updated_supp_fts_slice là [C, Hf, Wf]
-            # Cần đưa về shape [Way, Shot, B_sup, C, Hf, Wf] cho cls_unit
-            supp_fts_new = updated_supp_fts_slice.unsqueeze(0).unsqueeze(0).unsqueeze(0)
-            if DEBUG_SHAPES: print(f"[DEBUG] QESP: supp_fts_new.shape: {supp_fts_new.shape}")
-
-            # 4. Tính Score Lần Hai với `supp_fts_new`
-            #    res_fg_msk và res_bg_msk gốc vẫn được sử dụng để xác định vùng nào của supp_fts_new
-            #    sẽ được dùng để tạo prototype cho FG và BG khi cls_unit được gọi.
-            final_scores_list_qesp = []
-
-            if DEBUG_SHAPES: print(f"[DEBUG] QESP: Recalculating scores with updated support features...")
-            # Gọi cls_unit với supp_fts_new
-            bg_score_qesp, _, _ = self.cls_unit(qry_fts_orig, supp_fts_new, res_bg_msk, 
-                                              mode=BG_PROT_MODE, thresh=BG_THRESH, 
-                                              isval=isval, val_wsize=val_wsize, vis_sim=False) # Không cần vis_sim lần 2
-            final_scores_list_qesp.append(bg_score_qesp)
-            if DEBUG_SHAPES: print(f"[DEBUG] QESP: New BG score shape: {bg_score_qesp.shape if bg_score_qesp is not None else 'None'}")
-
-            # current_res_fg_msk_for_way0 vẫn là res_fg_msk[0] như ban đầu
-            fg_score_qesp, _, _ = self.cls_unit(qry_fts_orig, supp_fts_new, res_fg_msk,
-                                              mode=FG_PROT_MODE if F.avg_pool2d(current_res_fg_msk_for_way0, 4).max() >= FG_THRESH and FG_PROT_MODE != 'mask' else 'mask',
-                                              thresh=FG_THRESH, isval=isval, val_wsize=val_wsize, vis_sim=False)
-            final_scores_list_qesp.append(fg_score_qesp)
-            if DEBUG_SHAPES: print(f"[DEBUG] QESP: New FG score shape: {fg_score_qesp.shape if fg_score_qesp is not None else 'None'}")
-            
-            final_pred_for_loss = torch.cat(final_scores_list_qesp, dim=1) # [B_qry, 2, Hf, Wf]
-            if DEBUG_SHAPES: print(f"[DEBUG] QESP: final_pred_for_loss.shape (after QESP feature map update): {final_pred_for_loss.shape}")
-        
-        else: # Nếu không dùng QESP (hoặc SSFP cũ), thì giữ nguyên initial_pred
+        else: # Nếu không dùng QESP
             final_pred_for_loss = initial_pred
-        
-        # Các bước còn lại của forward (interpolate, alignment loss, etc.) giữ nguyên
-        # ...
+            if DEBUG_SHAPES: print(f"[DEBUG] QESP Skipped. Using initial_pred.")
 
 
         outputs.append(F.interpolate(final_pred_for_loss, size=img_size, mode='bilinear'))

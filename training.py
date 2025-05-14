@@ -38,19 +38,13 @@ def main(_run, _config, _log):
                         exist_ok=True)
             _run.observers[0].save_file(source_file, f'source/{source_file}')
         shutil.rmtree(f'{_run.observers[0].basedir}/_sources')
-
-    set_seed(_config['seed'])
-    cudnn.enabled = True
-    cudnn.benchmark = True
-    torch.cuda.set_device(device=_config['gpu_id'])
-    torch.set_num_threads(1)
     for backbone in backbones:
         # try:
             print("-"*10)
             print("Start training with backbone:", backbone)
             _log.info('###### Create model ######')
             model = FewShotSeg(pretrained_path=None, cfg=_config['model'], backbone=backbone)
-
+            print("Model loaded")
             model = model.cuda()
             model.train()
 

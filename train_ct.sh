@@ -47,7 +47,7 @@ do
     fi
 
     python3 training.py with \
-    'modelname=dlfcn_res101' \
+    'modelname=resnet' \
     'usealign=True' \
     'optim_type=sgd' \
     num_workers=$NWORKER \
