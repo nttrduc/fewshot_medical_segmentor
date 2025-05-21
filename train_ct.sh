@@ -22,7 +22,7 @@ EXCLU='[2,3]' # setting 2: excluding kidneies in training set to test generaliza
 
 ###### Training configs ######
 NSTEP=100100
-DECAY=0.95
+DECAY=1
 
 MAX_ITER=1000 # defines the size of an epoch
 SNAPSHOT_INTERVAL=25000 # interval for saving snapshot

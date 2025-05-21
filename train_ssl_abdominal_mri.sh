@@ -16,15 +16,16 @@ ALL_SCALE=( "MIDDLE") # config of pseudolabels
 RELOAD_PATH="/root/ducnt/fewshot_medical_segmentor/exps/myexperiments_MIDDLE_0/mySSL_train_CHAOST2_Superpix_lbgroup0_scale_MIDDLE_vfold0_CHAOST2_Superpix_sets_0_1shot/84/snapshots/25000.pth"
 
 ### Use L/R kidney as testing classes
-LABEL_SETS=0 
-EXCLU='[2,3]' # setting 2: excluding kidneies in training set to test generalization capability even though they are unlabeled. Use [] for setting 1 by Roy et al.
+LABEL_SETS=1 
+EXCLU='[1,4]' 
+# setting 2: excluding kidneies in training set to test generalization capability even though they are unlabeled. Use [] for setting 1 by Roy et al.
 ## Use Liver and spleen as testing classes
 # LABEL_SETS=1 
 # EXCLU='[1,4]' 
 
 ###### Training configs ######
 NSTEP=100100
-DECAY=0.95 # learning rate decay
+DECAY=1 # learning rate decay
 
 MAX_ITER=1400 # defines the size of an epoch
 SNAPSHOT_INTERVAL=5000 # interval for saving snapshot
@@ -49,7 +50,7 @@ do
     fi
 
     python3 training.py with \
-    'modelname=mobile' \
+    'modelname=resnet' \
     'usealign=True' \
     'optim_type=sgd' \
     num_workers=$NWORKER \

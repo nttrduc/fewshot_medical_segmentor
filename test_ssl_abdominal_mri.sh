@@ -78,8 +78,8 @@ ALL_EV=( 0) # 5-fold cross validation (0, 1, 2, 3, 4)
 ALL_SCALE=( "MIDDLE") # config of pseudolabels
 
 ### Use L/R kidney as testing classes
-LABEL_SETS=0 
-EXCLU='[2,3]' # setting 2: excluding kidneies in training set to test generalization capability even though they are unlabeled. Use [] for setting 1 by Roy et al.
+LABEL_SETS=1 
+EXCLU='[1,4]' # setting 2: excluding kidneies in training set to test generalization capability even though they are unlabeled. Use [] for setting 1 by Roy et al.
 
 ### Use Liver and spleen as testing classes
 # LABEL_SETS=1 
@@ -114,7 +114,7 @@ do
     RELOAD_PATH='/root/ducnt/fewshot_medical_segmentor/exps/myexperiments_MIDDLE_0/mySSL_train_CHAOST2_Superpix_lbgroup0_scale_MIDDLE_vfold0_CHAOST2_Superpix_sets_0_1shot/3/snapshots/epoch2000_mit_b0_0.083_0.08.pth' # path to the reloaded model
 
     python3 validation.py with \
-    'modelname=mobile' \
+    'modelname=resnet' \
     'usealign=True' \
     'optim_type=sgd' \
     reload_model_path=$RELOAD_PATH \

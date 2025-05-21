@@ -60,7 +60,7 @@ def cfg():
     z_margin = 0 
     eval_fold = 0 # which fold for 5 fold cross validation
     support_idx=[-1] # indicating which scan is used as support in testing. 
-    val_wsize=2 # L_H, L_W in testing
+    val_wsize=1 # L_H, L_W in testing
     n_sup_part = 3 # number of chuncks in testing
 
     # Network

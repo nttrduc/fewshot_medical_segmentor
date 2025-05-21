@@ -5,7 +5,8 @@ from collections import OrderedDict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+import cv2
+import numpy as np
 from .alpmodule import MultiProtoAsConv # Giữ nguyên module này
 from .backbone.torchvision_backbones import BackboneEncode
 from .backbone.torchvision_backbones import TVDeeplabRes101Encoder
@@ -169,7 +170,8 @@ class FewShotSeg(nn.Module):
             print(f"[DEBUG] res_fg_msk.shape: {res_fg_msk.shape}") # [1,1,1,16,16]
 
         align_loss = 0
-        outputs = []
+        outputs_alp = []
+        outputs_qsm = []
         assign_maps_list = [] # Sửa tên để tránh nhầm lẫn
         bg_sim_maps_list = []
         fg_sim_maps_list = []
@@ -215,10 +217,10 @@ class FewShotSeg(nn.Module):
         if DEBUG_SHAPES: print(f"[DEBUG] initial_pred.shape (concatenated scores): {initial_pred.shape}") # [1,2,16,16]
 
         final_pred_for_loss = initial_pred # Mặc định
-
+        temp = initial_pred
         # ---- QESP Logic (Query-Enriched Support Feature Map) ----
 # ---- QESP Logic (Query-Enriched Support Feature Map) ----
-        if self.config.get('use_qesp', False):
+        if self.config.get('use_qesp', True):
             if DEBUG_SHAPES: print(f"[DEBUG] --- Applying QESP (Feature Map Update) ---")
             
             # Bắt đầu với dự đoán ban đầu và đặc trưng support gốc
@@ -227,41 +229,68 @@ class FewShotSeg(nn.Module):
             current_support_features_for_qesp = supp_fts.clone() # Tạo bản sao để tránh thay đổi supp_fts gốc ngoài ý muốn
 
             # Lặp 3 lần cho QESP
-            num_qesp_iterations = 3
+            num_qesp_iterations = 1
             for i in range(num_qesp_iterations):
-                if DEBUG_SHAPES: print(f"\n[DEBUG] QESP Iteration {i+1}/{num_qesp_iterations}")
+                bg_scores_query_orig = current_prediction_for_qesp[:, 0, :, :] 
+                fg_scores_query_orig = current_prediction_for_qesp[:, 1, :, :] 
 
-                # ---- Bước 1: Tạo Prototypes từ Query dựa trên dự đoán *hiện tại* ----
-                # Sử dụng current_prediction_for_qesp từ vòng lặp trước (hoặc initial_pred cho i=0)
-                bg_scores_query = current_prediction_for_qesp[:, 0, :, :] # [B_qry, Hf, Wf]
-                fg_scores_query = current_prediction_for_qesp[:, 1, :, :] # [B_qry, Hf, Wf]
+                # 1a. Tạo mặt nạ nhị phân ban đầu (1 cho FG, 0 cho BG)
+                binary_pred_mask = torch.argmax(current_prediction_for_qesp, dim=1) 
+                if DEBUG_SHAPES: print(f"[DEBUG] QESP Iter {i+1}: binary_pred_mask (argmax).shape: {binary_pred_mask.shape}, unique: {torch.unique(binary_pred_mask)}")
 
-                # --- Lọc bằng Trung vị ---
-                query_fg_pixel_mask = torch.zeros_like(fg_scores_query).unsqueeze(1) # Khởi tạo mặt nạ rỗng
-                if fg_scores_query.numel() > 0 :
-                    fg_median_threshold = torch.median(fg_scores_query.view(fg_scores_query.shape[0], -1), dim=1).values
-                    fg_threshold_query_median = fg_median_threshold.unsqueeze(-1).unsqueeze(-1)
-                    query_fg_pixel_mask = (fg_scores_query >= fg_threshold_query_median).float().unsqueeze(1) # [B_qry, 1, Hf, Wf]
-                    if DEBUG_SHAPES:
-                        print(f"[DEBUG] QESP Iter {i+1}: fg_median_threshold.shape: {fg_median_threshold.shape}, example value: {fg_median_threshold[0].item() if fg_scores_query.numel() > 0 else 'N/A'}")
-                else:
-                    if DEBUG_SHAPES: print(f"[DEBUG] QESP Iter {i+1}: fg_scores_query is empty.")
+                # 1b. Tìm vùng liên thông lớn nhất (LCC) cho Foreground bằng cv2.connectedComponents
+                # Giả định B_qry là 1
+                binary_pred_mask_np_uint8 = binary_pred_mask[0].cpu().numpy().astype(np.uint8) # Shape [Hf, Wf]
 
-                query_bg_pixel_mask = torch.zeros_like(bg_scores_query).unsqueeze(1) # Khởi tạo mặt nạ rỗng
-                if bg_scores_query.numel() > 0:
-                    bg_median_threshold = torch.median(bg_scores_query.view(bg_scores_query.shape[0], -1), dim=1).values
-                    bg_threshold_query_median = bg_median_threshold.unsqueeze(-1).unsqueeze(-1)
-                    query_bg_pixel_mask = (bg_scores_query >= bg_threshold_query_median).float().unsqueeze(1) # [B_qry, 1, Hf, Wf]
-                    if DEBUG_SHAPES:
-                        print(f"[DEBUG] QESP Iter {i+1}: bg_median_threshold.shape: {bg_median_threshold.shape}, example value: {bg_median_threshold[0].item() if bg_scores_query.numel() > 0 else 'N/A'}")
-                else:
-                     if DEBUG_SHAPES: print(f"[DEBUG] QESP Iter {i+1}: bg_scores_query is empty.")
+                # Sử dụng cv2.connectedComponents theo cách bạn đề xuất
+                num_labels, labels_im = cv2.connectedComponents(binary_pred_mask_np_uint8, connectivity=8)
+                
+                lcc_mask_np = np.zeros_like(binary_pred_mask_np_uint8, dtype=np.uint8)
+                if num_labels > 1: # Có ít nhất một component foreground (label 0 là background)
+                    # Tính diện tích của từng vùng (bỏ nhãn 0 - nền)
+                    areas = [np.sum(labels_im == label_idx) for label_idx in range(1, num_labels)]
+                    
+                    if areas: # Nếu có ít nhất một vùng foreground
+                        largest_component_idx_in_areas = np.argmax(areas) # Index trong list 'areas'
+                        largest_label = largest_component_idx_in_areas + 1 # Label thực tế trong labels_im
+                        
+                        # Tạo mask chỉ chứa vùng lớn nhất
+                        lcc_mask_np = (labels_im == largest_label).astype(np.uint8)
+                
+                # Chuyển lcc_mask_np lại thành tensor
+                lcc_mask = torch.from_numpy(lcc_mask_np).unsqueeze(0).unsqueeze(0).float().to(current_prediction_for_qesp.device) # [1, 1, Hf, Wf]
+                if 1==1:
+                    print(f"[DEBUG] QESP Iter {i+1} (using cv2.connectedComponents): num_labels: {num_labels}")
+                    print(f"[DEBUG] QESP Iter {i+1} (using cv2.connectedComponents): lcc_mask.shape: {lcc_mask.shape}, sum: {lcc_mask.sum()}")
 
-                if DEBUG_SHAPES:
-                    print(f"[DEBUG] QESP Iter {i+1}: query_fg_pixel_mask (median).shape: {query_fg_pixel_mask.shape}, sum: {query_fg_pixel_mask.sum()}")
-                    print(f"[DEBUG] QESP Iter {i+1}: query_bg_pixel_mask (median).shape: {query_bg_pixel_mask.shape}, sum: {query_bg_pixel_mask.sum()}")
+                # 1c. Tạo query_fg_pixel_mask và query_bg_pixel_mask dựa trên LCC và scores gốc
+                
+                # --- Foreground mask ---
+                query_fg_pixel_mask = torch.zeros_like(fg_scores_query_orig).unsqueeze(1).to(current_prediction_for_qesp.device)
+                if lcc_mask.sum() > 0: 
+                    lcc_mask_bool_b0 = lcc_mask[0, 0].bool() 
+                    relevant_fg_scores_b0 = fg_scores_query_orig[0][lcc_mask_bool_b0]
+                    if relevant_fg_scores_b0.numel() > 0:
+                        fg_thresh_val_lcc = torch.quantile(relevant_fg_scores_b0, q=0.5)
+                        query_fg_pixel_mask = ((fg_scores_query_orig >= fg_thresh_val_lcc).unsqueeze(1) * lcc_mask).float()
+                        if DEBUG_SHAPES: print(f"[DEBUG] QESP Iter {i+1}: fg_thresh_val_lcc (median in LCC): {fg_thresh_val_lcc.item()}")
+                
+                if 1==1:
+                    print(f"[DEBUG] QESP Iter {i+1}: query_fg_pixel_mask (LCC + top 50% scores).shape: {query_fg_pixel_mask.shape}, sum: {query_fg_pixel_mask.sum()}")
 
-                # --- Tạo prototype query toàn cục ---
+                # --- Background mask ---
+                query_bg_pixel_mask = torch.zeros_like(bg_scores_query_orig).unsqueeze(1).to(current_prediction_for_qesp.device)
+                bg_region_mask = 1.0 - lcc_mask 
+                if bg_region_mask.sum() > 0: 
+                    bg_region_mask_bool_b0 = bg_region_mask[0, 0].bool()
+                    relevant_bg_scores_b0 = bg_scores_query_orig[0][bg_region_mask_bool_b0]
+                    if relevant_bg_scores_b0.numel() > 0:
+                        bg_thresh_val_non_lcc = torch.quantile(relevant_bg_scores_b0, q=0.5)
+                        query_bg_pixel_mask = ((bg_scores_query_orig >= bg_thresh_val_non_lcc).unsqueeze(1) * bg_region_mask).float()
+                        if DEBUG_SHAPES: print(f"[DEBUG] QESP Iter {i+1}: bg_thresh_val_non_lcc (median in non-LCC): {bg_thresh_val_non_lcc.item()}")
+
+                if 1==1:
+                    print(f"[DEBUG] QESP Iter {i+1}: query_bg_pixel_mask (non-LCC + top 50% scores).shape: {query_bg_pixel_mask.shape}, sum: {query_bg_pixel_mask.sum()}")                # --- Tạo prototype query toàn cục ---
                 Pq_fg_global_norm = None
                 if query_fg_pixel_mask.sum() > 0:
                     # Sử dụng đặc trưng query gốc (không thay đổi qua các vòng lặp QESP)
@@ -289,8 +318,8 @@ class FewShotSeg(nn.Module):
 
                 # ---- Bước 3: Cập nhật Đặc trưng Support ----
                 # Sử dụng supp_fts_slice_this_iter và các prototype query MỚI (Pq_fg/bg_global_norm)
-                alpha_fg = self.config.get('qesp_alpha_update', 0.8)
-                alpha_bg = self.config.get('qesp_alpha_update', 0.8)
+                alpha_fg = self.config.get('qesp_alpha_update', 0.65)
+                alpha_bg = self.config.get('qesp_alpha_update', 0.5)
                 updated_supp_fts_slice_this_iter = supp_fts_slice_this_iter.clone() # Tạo bản sao để cập nhật
 
                 # Cập nhật vùng FG
@@ -354,9 +383,11 @@ class FewShotSeg(nn.Module):
             final_pred_for_loss = initial_pred
             if DEBUG_SHAPES: print(f"[DEBUG] QESP Skipped. Using initial_pred.")
 
-
-        outputs.append(F.interpolate(final_pred_for_loss, size=img_size, mode='bilinear'))
-        if DEBUG_SHAPES: print(f"[DEBUG] outputs[-1].shape (interpolated final pred): {outputs[-1].shape}")
+        
+        outputs_qsm.append(F.interpolate(final_pred_for_loss, size=img_size, mode='bilinear'))
+        outputs_alp.append(F.interpolate(temp, size=img_size, mode='bilinear'))
+        # if DEBUG_SHAPES
+        if DEBUG_SHAPES: print(f"[DEBUG] outputs[-1].shape (interpolated final pred): {outputs_alp[-1].shape}")
 
         # ---- Alignment Loss ----
         if self.config['align'] and self.training:
@@ -386,10 +417,13 @@ class FewShotSeg(nn.Module):
             align_loss += align_loss_epi
             if DEBUG_SHAPES: print(f"[DEBUG] align_loss_epi: {align_loss_epi.item() if isinstance(align_loss_epi, torch.Tensor) else align_loss_epi}")
 
-        output_final = torch.stack(outputs, dim=1)
-        if DEBUG_SHAPES: print(f"[DEBUG] output_final.shape (stacked): {output_final.shape}") # [N_queries, B_qry, Num_classes, H, W] -> [1,1,2,256,256]
-        output_final = output_final.view(-1, *output_final.shape[2:])
-        if DEBUG_SHAPES: print(f"[DEBUG] output_final.shape (viewed): {output_final.shape}") # [1,2,256,256]
+        output_final_qsm = torch.stack(outputs_qsm, dim=1)
+        output_final_alp = torch.stack(outputs_alp, dim=1)
+        if DEBUG_SHAPES: print(f"[DEBUG] output_final.shape (stacked): {output_final_qsm.shape}") # [N_queries, B_qry, Num_classes, H, W] -> [1,1,2,256,256]
+        output_final_alp = output_final_alp.view(-1, *output_final_alp.shape[2:])
+        output_final_qsm = output_final_qsm.view(-1, *output_final_qsm.shape[2:])
+        
+        if DEBUG_SHAPES: print(f"[DEBUG] output_final.shape (viewed): {output_final_qsm.shape}") # [1,2,256,256]
 
         final_assign_maps = torch.stack(assign_maps_list, dim=1) if assign_maps_list and assign_maps_list[0] is not None else None
         final_bg_sim_maps = torch.stack(bg_sim_maps_list, dim=1) if show_viz and bg_sim_maps_list and bg_sim_maps_list[0] is not None else None
@@ -400,7 +434,7 @@ class FewShotSeg(nn.Module):
             print(f"[DEBUG] final_bg_sim_maps.shape: {final_bg_sim_maps.shape if final_bg_sim_maps is not None else 'None'}")
             print(f"[DEBUG] final_fg_sim_maps.shape: {final_fg_sim_maps.shape if final_fg_sim_maps is not None else 'None'}")
             print("--- Exiting FewShotSeg.forward (with SSFP logic) ---\n")
-        return output_final, align_loss / sup_bsize if sup_bsize > 0 else 0, [final_bg_sim_maps, final_fg_sim_maps], final_assign_maps
+        return  output_final_alp,output_final_qsm, align_loss / sup_bsize if sup_bsize > 0 else 0, [final_bg_sim_maps, final_fg_sim_maps], final_assign_maps
 
 
     def alignLoss(self, qry_fts_single, pred_single, supp_fts_single_way_shot, fore_mask_single_way_shot, back_mask_single_way_shot):
